@@ -1,0 +1,336 @@
+{
+  "review_groups": {
+    "type": "list",
+    "description": "审核群群号",
+    "hint": "审核群（临时群）的群号列表，例如 [\"123456789\"]。机器人必须是这些群的成员，且建议设为群管理员，否则无法踢人、无法读取成员列表。只有在这些群里才会触发入群提问、答错踢出与每日清理。",
+    "default": []
+  },
+  "admin_ids": {
+    "type": "list",
+    "description": "插件管理员 QQ 号",
+    "hint": "可以使用审核管理指令、且不会被清理/审核的账号。AstrBot 全局管理员（配置 admins_id）同样有效。",
+    "default": []
+  },
+  "exempt_user_ids": {
+    "type": "list",
+    "description": "免清理免审核用户",
+    "hint": "这些账号不会被每日清理移出，也不会被提问（例如长期驻群协助审核的人）。注意：该名单不会获得管理指令权限，需要权限请同时填入 admin_ids。",
+    "default": []
+  },
+  "questions": {
+    "type": "template_list",
+    "description": "问题库（审核问题）",
+    "hint": "新人入群时从「已启用」的题目里随机抽一条提问。每题的 answers 是该题的答案库，任意一条命中即通过；留空则依赖下方「通用答案库」。可以给不同题目设置不同的匹配方式，先用 /审核 题库 总览、/审核 试答 验证。",
+    "templates": {
+      "question_item": {
+        "name": "审核问题",
+        "display_item": "question",
+        "hide_hint_in_list": true,
+        "items": {
+          "enabled": {
+            "type": "bool",
+            "description": "启用该题",
+            "hint": "关掉后不会被抽中，但配置会保留（适合暂时下架某道题）。",
+            "default": true
+          },
+          "question": {
+            "type": "text",
+            "description": "问题内容",
+            "default": ""
+          },
+          "hint": {
+            "type": "text",
+            "description": "该题的额外提示",
+            "hint": "会附在提问后面发给成员（例如「提示：答案是一个四字词」）。留空则不显示。",
+            "allow_empty": true,
+            "default": ""
+          },
+          "answers": {
+            "type": "list",
+            "description": "该题的答案库",
+            "hint": "该题下可接受的回答，任意一条命中即通过。",
+            "default": []
+          },
+          "match_mode": {
+            "type": "string",
+            "description": "该题的匹配方式",
+            "hint": "inherit：跟随全局 match_mode；contains：包含关键词；exact：归一化后完全相等；regex：按正则匹配；fuzzy：先按包含，再按相似度（阈值见 fuzzy_threshold，能容忍错别字与多写的字）。",
+            "options": [
+              "inherit",
+              "contains",
+              "exact",
+              "regex",
+              "fuzzy"
+            ],
+            "default": "inherit"
+          }
+        }
+      }
+    },
+    "default": [
+      {
+        "__template_key": "question_item",
+        "enabled": true,
+        "question": "请回答：你是怎么知道本群的？",
+        "hint": "例如：朋友推荐 / 群搜索 / 群友邀请",
+        "answers": [
+          "朋友",
+          "群友",
+          "推荐",
+          "邀请",
+          "搜索",
+          "贴吧",
+          "视频",
+          "b站"
+        ],
+        "match_mode": "contains"
+      },
+      {
+        "__template_key": "question_item",
+        "enabled": true,
+        "question": "示例题：1 + 1 = ?（请改成你自己的问题）",
+        "hint": "",
+        "answers": [
+          "2",
+          "二",
+          "two"
+        ],
+        "match_mode": "exact"
+      },
+      {
+        "__template_key": "question_item",
+        "enabled": false,
+        "question": "备用题：你希望在本群获得什么？（默认停用，示例如何下架题目）",
+        "hint": "",
+        "answers": [
+          "学习",
+          "交流",
+          "资源",
+          "请教"
+        ],
+        "match_mode": "fuzzy"
+      }
+    ]
+  },
+  "common_answers": {
+    "type": "list",
+    "description": "答案库（通用答案）",
+    "hint": "任何题目下，命中这里的任意一条都直接通过——适合放邀请码、口令这类万能答案。留空表示不启用。",
+    "default": []
+  },
+  "match_mode": {
+    "type": "string",
+    "description": "答案匹配方式（全局默认）",
+    "hint": "contains：答案作为关键词，出现在回复中即通过（最宽松）；exact：忽略大小写、空白和标点后完全相等才通过（最严格）；regex：把答案当作正则表达式匹配回复；fuzzy：先按包含，命中不了再算相似度（能容忍错别字、多写的字，阈值见 fuzzy_threshold）。单道题可在 questions 里用「该题的匹配方式」覆盖全局设置。仅 review_mode 为 rule 或 hybrid 时生效。",
+    "options": [
+      "contains",
+      "exact",
+      "regex",
+      "fuzzy"
+    ],
+    "default": "contains"
+  },
+  "fuzzy_threshold": {
+    "type": "float",
+    "description": "模糊匹配阈值",
+    "hint": "0.5~1.0，越大越严格（1.0 等于完全相等）；推荐 0.8。只在匹配方式为 fuzzy 时使用：回答与某个答案的相似度达到该值即通过。",
+    "default": 0.8,
+    "slider": {
+      "min": 0.5,
+      "max": 1.0,
+      "step": 0.05
+    }
+  },
+  "review_mode": {
+    "type": "string",
+    "description": "审核判定方式",
+    "hint": "rule：只用答案规则判定（默认，不消耗模型额度）；llm：把问题和参考答案交给大模型判定，能识别同义表述；hybrid：规则先命中就直接通过，没命中再交给大模型（推荐开启 LLM 时选这个，省钱又快）。模型调用失败或返回无法解析时会自动回退到规则判定并记录日志。",
+    "options": [
+      "rule",
+      "llm",
+      "hybrid"
+    ],
+    "default": "rule"
+  },
+  "review_llm_provider": {
+    "type": "string",
+    "description": "审核用模型提供商",
+    "hint": "留空表示跟随当前会话使用的模型；题库管理页的「大模型自动填入」没有会话上下文，会改用这里指定的模型，未指定时用第一个可用的对话模型。建议单独选一个小而快的模型，避免用贵模型做出入群判定。",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "llm_review_prompt": {
+    "type": "text",
+    "description": "LLM 审核提示词",
+    "hint": "可用占位符：{question} 审核问题、{answers} 参考答案、{answer} 成员回答、{user} 成员昵称、{group} 群号。模型必须只回 PASS 或 FAIL。",
+    "default": "请判断申请人的回答是否满足入群要求。\n\n审核问题：{question}\n参考答案（意思一致即可）：{answers}\n申请人的回答：{answer}\n\n判断标准：与参考答案意思一致、或能合理回答该问题的，视为通过；答非所问、明显敷衍（如“不知道”“随便”“1”“？”）、与参考答案无关的，不予通过。\n只输出一个词：PASS 或 FAIL。"
+  },
+  "llm_review_timeout_seconds": {
+    "type": "float",
+    "description": "LLM 审核超时（秒）",
+    "hint": "超过该时间未返回则放弃本次模型判定，回退到规则判定，避免成员一直等不到反馈。",
+    "default": 20.0,
+    "slider": {
+      "min": 1.0,
+      "max": 60.0,
+      "step": 1.0
+    }
+  },
+  "max_attempts": {
+    "type": "int",
+    "description": "允许答错次数",
+    "hint": "答错达到该次数后踢出（kick_on_fail 为 false 时只提示不踢出）。",
+    "default": 3,
+    "slider": {
+      "min": 1,
+      "max": 10,
+      "step": 1
+    }
+  },
+  "kick_on_fail": {
+    "type": "bool",
+    "description": "答错次数用尽后踢出",
+    "hint": "关闭后仅停止审核并清空该成员的回答次数，不会把他移出群。",
+    "default": true
+  },
+  "reject_add_request": {
+    "type": "bool",
+    "description": "踢出时拒绝再次加群",
+    "hint": "踢人时是否同时勾选“拒绝再加群”。每日清理和审核失败踢出都会生效，请谨慎开启。",
+    "default": false
+  },
+  "auto_enroll_on_speak": {
+    "type": "bool",
+    "description": "未记录成员发言时补发问题",
+    "hint": "当机器人重启、漏掉入群事件时，普通成员在审核群里发言会补发审核问题（不会消耗他的答题次数）。关闭后只处理机器人亲眼看到的入群事件。",
+    "default": true
+  },
+  "question_message": {
+    "type": "text",
+    "description": "提问文案",
+    "hint": "可用占位符：{user} 昵称、{question} 问题、{max_attempts} 允许答错次数。",
+    "default": "欢迎加入！请回答下面的问题完成审核：\n\n{question}\n\n（共 {max_attempts} 次机会，答错将被移出本群）"
+  },
+  "retry_message": {
+    "type": "text",
+    "description": "答错提示",
+    "hint": "可用占位符：{user}、{remaining} 剩余次数、{max_attempts}。",
+    "default": "回答不正确，请再试一次。你还有 {remaining} 次机会。"
+  },
+  "success_message": {
+    "type": "text",
+    "description": "通过提示（群内）",
+    "hint": "可用占位符：{user}、{code} 当日验证码、{expire} 失效时间、{group} 群号。默认不含 {code}（验证码走私聊）。若 code_send_mode 包含群内发码，请自行加上 {code}；没加也不会漏码——发码时会自动补一行「（验证码：xxx）」。",
+    "default": "审核通过！验证码已私聊发送，请注意查收（有效期至 {expire}）。\n若未收到，请先添加机器人为好友，或联系管理员补发。"
+  },
+  "kick_message": {
+    "type": "text",
+    "description": "审核失败提示",
+    "hint": "可用占位符：{user} 昵称、{max_attempts}。",
+    "default": "{user} 未通过审核，已移出本群。"
+  },
+  "code_length": {
+    "type": "int",
+    "description": "验证码长度",
+    "hint": "4 ~ 32 位。",
+    "default": 6,
+    "slider": {
+      "min": 4,
+      "max": 32,
+      "step": 1
+    }
+  },
+  "code_charset": {
+    "type": "string",
+    "description": "验证码字符集",
+    "hint": "默认已剔除 0/O/1/I 等易混淆字符。要求至少包含 4 个不同字符。",
+    "default": "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+  },
+  "code_reset_time": {
+    "type": "string",
+    "description": "验证码重置时间",
+    "hint": "每天 HH:MM（24 小时制，按下方时区）自动生成新验证码。填空字符串或 off 表示不自动重置，只能由管理员手动重置。",
+    "default": "00:00"
+  },
+  "code_send_mode": {
+    "type": "string",
+    "description": "验证码发送方式",
+    "hint": "private：只私聊发送（默认，推荐；需成员与机器人是好友）；group：只发在群里；both：两处都发。私聊失败时会记录日志，可用「/审核 补发 <QQ号>」重发。",
+    "options": [
+      "private",
+      "group",
+      "both"
+    ],
+    "default": "private"
+  },
+  "private_code_message": {
+    "type": "text",
+    "description": "私聊发码文案",
+    "hint": "可用占位符：{code} 验证码、{expire} 失效时间、{user} 昵称、{group} 群号。",
+    "default": "你的审核验证码是：{code}\n有效期至 {expire}，请勿转发给他人。"
+  },
+  "code_fallback_to_group": {
+    "type": "bool",
+    "description": "私聊失败时回退到群内发码",
+    "hint": "开启后，code_send_mode=private 时如果私聊发不出去（对方没加机器人好友/临时会话被限制），会改为在群里发码，保证成员拿得到；关闭则只在群里提示「验证码已私聊发送」，由管理员用「/审核 补发」处理。",
+    "default": false
+  },
+  "private_send_channel": {
+    "type": "string",
+    "description": "私聊通道",
+    "hint": "auto（默认）：先走群临时会话（成员无需加机器人好友即可收到），失败再退回好友私聊；temp_session：只用群临时会话；friend：只用好友私聊。群临时会话要求机器人与该成员在同一个群，且多数协议端要求成员近期在群里发过言——本插件正是在成员群里答完题后发码，所以通常可用。",
+    "options": [
+      "auto",
+      "temp_session",
+      "friend"
+    ],
+    "default": "auto"
+  },
+  "cleanup_time": {
+    "type": "string",
+    "description": "每日清理时间",
+    "hint": "每天 HH:MM（24 小时制，按下方时区）把审核群里的普通成员全部移出。填空字符串或 off 表示关闭每日清理。",
+    "default": "00:00"
+  },
+  "cleanup_keep_approved": {
+    "type": "bool",
+    "description": "清理时保留已通过审核的成员",
+    "hint": "默认关闭：按“清理所有普通成员”的语义，已通过者也一并移出（他们在通过时已拿到验证码）。开启后已通过者不会被清理，且不会在次日重复收到问题。",
+    "default": false
+  },
+  "cleanup_notice": {
+    "type": "text",
+    "description": "清理后的群公告",
+    "hint": "留空表示不发送。可用占位符：{count} 本次移出人数、{group} 群号。",
+    "default": ""
+  },
+  "kick_interval_seconds": {
+    "type": "float",
+    "description": "踢人间隔（秒）",
+    "hint": "每次踢人之间的等待时间，用于降低触发协议端风控的概率。",
+    "default": 1.0,
+    "slider": {
+      "min": 0.0,
+      "max": 10.0,
+      "step": 0.5
+    }
+  },
+  "keep_group_admins": {
+    "type": "bool",
+    "description": "保留群主与群管理员",
+    "hint": "开启时每日清理会跳过群主和管理员，关闭则连他们一起清理（不建议）。",
+    "default": true
+  },
+  "timezone": {
+    "type": "string",
+    "description": "时区",
+    "hint": "IANA 时区名，例如 Asia/Shanghai。留空则使用系统本地时区（Docker 部署请确认容器 TZ）。",
+    "default": ""
+  },
+  "group_admin_can_query": {
+    "type": "bool",
+    "description": "允许群主/群管理员查询验证码",
+    "hint": "开启后，审核群内的群主与群管理员也可以使用查询指令，方便他们现场核对验证码。",
+    "default": true
+  }
+}

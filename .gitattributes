@@ -1,0 +1,10 @@
+# 统一按 LF 检出：插件要同时跑在 Windows 与 Linux(Docker) 上，
+# 且 dist/ 里的 zip 是按 LF 内容生成的，固定换行符才能复现同样的 sha256。
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.zip binary

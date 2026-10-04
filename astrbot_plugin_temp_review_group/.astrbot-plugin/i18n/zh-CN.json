@@ -1,0 +1,12 @@
+{
+  "pages": {
+    "settings": {
+      "title": "审核群设置",
+      "description": "查看并修改临时审核群插件的全部配置"
+    },
+    "questions": {
+      "title": "题库管理",
+      "description": "展开式问题列表，可写答案，也能让大模型从文本自动填入"
+    }
+  }
+}

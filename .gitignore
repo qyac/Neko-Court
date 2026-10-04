@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 自检 / 打包产物
+.selftest_data/
+dist/
+*.zip
+.commitmsg.tmp
+commit-msg*.txt
+
+# 编辑器与系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 本地参考资料（不随仓库分发）
+新建 文本文档.txt
+AstrBot插件开发指南总结.md

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>审核群设置</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app" class="page" data-state="loading">
+      <header class="page-header">
+        <div class="title-row">
+          <h1 id="page-title" class="page-title">审核群设置</h1>
+          <span id="plugin-version" class="version" hidden></span>
+        </div>
+        <p id="page-desc" class="page-desc">查看并修改临时审核群插件的全部配置</p>
+      </header>
+
+      <section id="status-bar" class="status-bar" aria-label="运行时状态"></section>
+
+      <div id="message-bar" class="message-bar" role="status" aria-live="polite" hidden></div>
+
+      <div class="toolbar">
+        <nav id="group-nav" class="group-nav" aria-label="配置分组"></nav>
+        <div class="toolbar-actions">
+          <span id="dirty-hint" class="dirty-hint" hidden>有未保存的改动</span>
+          <button id="btn-restore-defaults" type="button" class="btn">恢复默认值</button>
+          <button id="btn-reload" type="button" class="btn">重新加载</button>
+          <button id="btn-save" type="button" class="btn btn-primary" disabled>保存</button>
+        </div>
+      </div>
+
+      <main id="groups" class="groups" aria-label="插件配置"></main>
+
+      <p class="footer-note">
+        设置项来自插件 <code>_conf_schema.json</code>；保存后立即写入插件配置。
+      </p>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

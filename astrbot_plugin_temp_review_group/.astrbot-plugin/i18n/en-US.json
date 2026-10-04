@@ -1,0 +1,12 @@
+{
+  "pages": {
+    "settings": {
+      "title": "Review Group Settings",
+      "description": "View and edit all settings of the temporary review group plugin"
+    },
+    "questions": {
+      "title": "Question Bank",
+      "description": "Expandable question list with answers, plus LLM auto-fill from pasted text"
+    }
+  }
+}

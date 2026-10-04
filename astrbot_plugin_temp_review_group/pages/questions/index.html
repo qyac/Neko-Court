@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>题库管理</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app" class="page" data-state="loading">
+      <header class="page-header">
+        <div class="title-row">
+          <h1 id="page-title" class="page-title">题库管理</h1>
+          <span id="plugin-version" class="version" hidden></span>
+        </div>
+        <p id="page-desc" class="page-desc">展开式问题列表，可写答案，也能让大模型从文本自动填入</p>
+      </header>
+
+      <section id="status-bar" class="status-bar" aria-label="题库状态"></section>
+
+      <div id="message-bar" class="message-bar" role="status" aria-live="polite" hidden></div>
+
+      <div id="toolbar" class="toolbar">
+        <div class="toolbar-actions">
+          <span id="dirty-hint" class="dirty-hint" hidden>有未保存的改动</span>
+          <button id="btn-add" type="button" class="btn">新增题目</button>
+          <button id="btn-expand-all" type="button" class="btn" disabled>全部展开</button>
+          <button id="btn-collapse-all" type="button" class="btn" disabled>全部折叠</button>
+          <button id="btn-reload" type="button" class="btn">重新加载</button>
+          <button id="btn-save" type="button" class="btn btn-primary" disabled>保存题库</button>
+        </div>
+      </div>
+
+      <main id="main" class="main">
+        <section class="card" aria-labelledby="questions-heading">
+          <div class="card-head">
+            <h2 id="questions-heading" class="card-title">问题库</h2>
+            <span id="questions-count" class="card-count"></span>
+          </div>
+          <p id="questions-hint" class="card-hint">
+            点「展开」编辑单题：题干、提示、答案库、匹配方式与启用状态。新人入群时从已启用的题目里随机抽一条提问。
+          </p>
+          <div id="question-list" class="question-list" aria-describedby="questions-hint"></div>
+        </section>
+
+        <section class="card" aria-labelledby="common-heading">
+          <div class="card-head">
+            <h2 id="common-heading" class="card-title">通用答案库</h2>
+            <span id="common-count" class="card-count"></span>
+          </div>
+          <p id="common-hint" class="card-hint">任何题目下命中都直接通过（邀请码 / 口令）。</p>
+          <div class="field">
+            <label class="field-label" for="common-answers-input">通用答案</label>
+            <div id="common-editor" aria-describedby="common-hint"></div>
+            <p class="field-hint">回车 / 逗号 / 顿号 / 分号 / 换行分隔，重复项会自动去重。</p>
+          </div>
+        </section>
+
+        <section class="card" aria-labelledby="parse-heading">
+          <div class="card-head">
+            <h2 id="parse-heading" class="card-title">大模型自动填入</h2>
+            <span id="parse-limit" class="card-count"></span>
+          </div>
+          <p id="parse-hint" class="card-hint">
+            把招新公告、题库文档或聊天记录粘贴进来，让大模型整理成「题目 + 答案」草稿；草稿可以在加入前逐条修改。
+          </p>
+
+          <div class="field">
+            <label class="field-label" for="parse-text">待解析文本</label>
+            <textarea
+              id="parse-text"
+              class="input input-textarea"
+              rows="7"
+              spellcheck="false"
+              aria-describedby="parse-counter parse-hint"
+            ></textarea>
+            <p id="parse-counter" class="field-hint">0 / 8000 字</p>
+          </div>
+
+          <p id="parse-unavailable" class="field-hint hint-warn" hidden>
+            没有可用的对话模型，请先在 AstrBot 配置模型或在插件配置里指定 review_llm_provider
+          </p>
+
+          <div class="parse-actions">
+            <button id="btn-parse" type="button" class="btn btn-primary">让大模型解析</button>
+            <button id="btn-parse-add" type="button" class="btn btn-primary" hidden>加入题库（0 条）</button>
+            <button id="btn-parse-clear" type="button" class="btn" hidden>清空解析结果</button>
+          </div>
+
+          <p id="parse-status" class="parse-status" role="status" aria-live="polite" hidden></p>
+
+          <div id="parse-raw-wrap" class="raw-wrap" hidden>
+            <button
+              id="btn-parse-raw"
+              type="button"
+              class="btn btn-small btn-ghost"
+              aria-expanded="false"
+              aria-controls="parse-raw"
+            >
+              查看模型原始输出
+            </button>
+            <pre id="parse-raw" class="raw-box" hidden></pre>
+          </div>
+
+          <div id="parse-drafts" class="draft-list"></div>
+        </section>
+      </main>
+
+      <p class="footer-note">
+        题库与通用答案库保存在插件配置里；可用题目为 0 时新人入群不会收到问题。
+      </p>
+    </div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
