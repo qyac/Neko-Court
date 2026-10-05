@@ -28,6 +28,8 @@ export const FIELD_GROUPS = [
       "kick_on_fail",
       "reject_add_request",
       "auto_enroll_on_speak",
+      "welcome_message",
+      "join_message_mode",
       "question_message",
       "retry_message",
       "success_message",

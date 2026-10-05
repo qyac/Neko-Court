@@ -2,7 +2,7 @@ name: astrbot_plugin_temp_review_group
 display_name: 临时审核群管理
 desc: 临时审核群专用：每日定时清理普通成员、新人入群自动提问、答错 N 次踢出、答对下发当日验证码，验证码每日重置且支持管理员查询。
 short_desc: 临时审核群：定时清理 / 入群提问 / 答错踢出 / 每日验证码
-version: v1.1.2
+version: v1.1.3
 author: neko-court
 repo: ""
 astrbot_version: ">=4.10.4"

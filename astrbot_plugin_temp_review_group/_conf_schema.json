@@ -205,11 +205,28 @@
     "hint": "当机器人重启、漏掉入群事件时，普通成员在审核群里发言会补发审核问题（不会消耗他的答题次数）。关闭后只处理机器人亲眼看到的入群事件。",
     "default": true
   },
+  "welcome_message": {
+    "type": "text",
+    "description": "入群欢迎语",
+    "hint": "新人入群（或首次发言触发补发）时先发这段欢迎语，问题随后附上。可用占位符：{at} 提及新人、{user} 昵称、{group} 群号、{question} 直接插入问题、{max_attempts} 允许答错次数。留空表示不发欢迎语，只发问题。",
+    "default": "🎉 {at} 欢迎加入本群！\n入群前先完成下面这道小问题，答对后我会私聊把验证码发给你～"
+  },
+  "join_message_mode": {
+    "type": "string",
+    "description": "欢迎语与问题的发送方式",
+    "hint": "merge：欢迎语与问题合成一条消息（默认，最像“欢迎语里带问题”）；separate：先发欢迎语、再发问题（两条消息）；question_only：只发问题，不发欢迎语。",
+    "options": [
+      "merge",
+      "separate",
+      "question_only"
+    ],
+    "default": "merge"
+  },
   "question_message": {
     "type": "text",
-    "description": "提问文案",
-    "hint": "可用占位符：{at} 提及新人（放在开头即 @ 新人，也可放到句中）、{user} 昵称、{question} 问题、{max_attempts} 允许答错次数。",
-    "default": "{at} 欢迎加入！请回答下面的问题：\n\n{question}\n\n（共 {max_attempts} 次机会，答错将被移出本群）"
+    "description": "提问文案（问题部分）",
+    "hint": "可用占位符：{at} 提及新人、{user} 昵称、{question} 问题、{max_attempts} 允许答错次数、{hint} 该题提示。欢迎语在 welcome_message 里单独配；若欢迎语里已经写过 {at}，合并发送时会自动只保留一个 @。",
+    "default": "请回答下面的问题完成入群审核：\n\n{question}\n\n（共 {max_attempts} 次机会，答错将被移出本群）"
   },
   "retry_message": {
     "type": "text",

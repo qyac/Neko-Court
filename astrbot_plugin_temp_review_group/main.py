@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.2"
+PLUGIN_VERSION = "v1.1.3"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -91,6 +91,8 @@ PRIVATE_SEND_CHANNELS = ("auto", "temp_session", "friend")
 # 答案匹配方式：inherit 只用于单道题的覆盖设置（表示跟随全局）
 MATCH_MODES = ("contains", "exact", "regex", "fuzzy")
 MATCH_MODE_CHOICES = ("inherit",) + MATCH_MODES
+# 入群消息组合方式：merge = 欢迎语与问题合成一条；separate = 先欢迎语再问题；question_only = 只发问题
+JOIN_MESSAGE_MODES = ("merge", "separate", "question_only")
 # LLM 审核：系统提示词固定，要求模型只回一个判定词
 LLM_JUDGE_SYSTEM_PROMPT = (
     "你是入群审核判定器。根据审核问题、参考答案和申请人的回答，判断申请人是否通过。"
@@ -1065,6 +1067,11 @@ class TempReviewGroup(Star):
         mode = str(self._get("review_mode", "rule") or "rule").strip().lower()
         return mode if mode in {"rule", "llm", "hybrid"} else "rule"
 
+    def _join_message_mode(self) -> str:
+        """入群消息的组合方式：merge（欢迎语+问题一条）/ separate（两条）/ question_only（只发问题）。"""
+        mode = str(self._get("join_message_mode", "merge") or "merge").strip().lower()
+        return mode if mode in JOIN_MESSAGE_MODES else "merge"
+
     def _code_send_mode(self) -> str:
         mode = str(self._get("code_send_mode", "private") or "private").strip().lower()
         return mode if mode in CODE_SEND_MODES else "private"
@@ -1236,18 +1243,52 @@ class TempReviewGroup(Star):
             logger.warning("[审核群] 无群号且私聊失败，验证码未能送达用户 %s。", user_id)
         return result
 
-    async def _ask_question(self, event: AstrMessageEvent, user_id: str, question: dict[str, Any], scene: str) -> bool:
-        text = self._render(
+    async def _ask_question(
+        self,
+        event: AstrMessageEvent,
+        user_id: str,
+        question: dict[str, Any],
+        scene: str,
+        with_welcome: bool = True,
+    ) -> bool:
+        """发提问。with_welcome 为真时按 join_message_mode 带上欢迎语。"""
+        user_name = event.get_sender_name() or user_id
+        group_id = str(event.get_group_id() or "")
+        mode = self._join_message_mode()
+        question_text = self._render(
             self._template("question_message"),
-            user=event.get_sender_name() or user_id,
+            user=user_name,
             question=str(question.get("question") or ""),
             max_attempts=self._max_attempts(),
         )
         hint = str(question.get("hint") or "").strip()
-        if hint and hint not in text:
+        if hint and hint not in question_text:
             # 该题配了提示但文案里没写 {hint}：直接附一行，避免"配了不生效"
-            text = f"{text}\n提示：{hint}"
-        sent = await self._send_event_chain(event, self._mention_components(text, user_id))
+            question_text = f"{question_text}\n提示：{hint}"
+
+        welcome_template = self._template("welcome_message").strip()
+        welcome_text = ""
+        if with_welcome and mode != "question_only" and welcome_template:
+            welcome_text = self._render(
+                welcome_template,
+                user=user_name,
+                group=group_id,
+                max_attempts=self._max_attempts(),
+                question=str(question.get("question") or ""),
+            )
+
+        if welcome_text and mode == "separate":
+            # 两条消息：欢迎语一条、问题一条
+            sent = await self._send_event_chain(event, self._mention_components(welcome_text, user_id))
+            sent = await self._send_event_chain(event, self._mention_components(question_text, user_id)) and sent
+        else:
+            text = question_text
+            if welcome_text:
+                if "{at}" in welcome_text and "{at}" in question_text:
+                    # 合成一条时只保留欢迎语里的那个 @，避免同一条消息里 @ 两次
+                    question_text = question_text.replace("{at}", "")
+                text = f"{welcome_text}\n\n{question_text}".strip()
+            sent = await self._send_event_chain(event, self._mention_components(text, user_id))
         if sent:
             self._diag_bump("asked")
             self._diag["last_question"] = {
@@ -1707,6 +1748,7 @@ class TempReviewGroup(Star):
                 question=str(question.get("question") or ""),
                 max_attempts=self._max_attempts(),
             )
+            # 重审不带欢迎语：管理员手动重发，只补问题
             await self._send_to_group(group_id, components=self._mention_components(text, user_id))
             yield event.plain_result(f"🔁 已重置 QQ {user_id} 的审核记录并重新提问（群 {group_id}）。")
         elif question is None:

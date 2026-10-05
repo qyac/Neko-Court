@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.2",
+            version="v1.1.3",
             desc="自检用元数据",
         )
 
@@ -1575,7 +1575,79 @@ async def main():
         plugin.config["max_attempts"] = 3
         plugin.config["kick_message"] = "{user} 未通过审核"
 
-        print("\n[20] Pages 资源结构")
+        print("\n[20] 以欢迎语的方式发问题（welcome_message / join_message_mode）")
+        reset_review(review_mode="rule", code_send_mode="private", private_send_channel="auto")
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "1+1=?", "hint": "", "answers": ["2"], "match_mode": "inherit"}
+        ]
+        plugin.config["welcome_message"] = "🎉 {at} 欢迎加入本群！先答个题～"
+        plugin.config["question_message"] = "请回答：{question}"
+
+        # 1) 默认 merge：一条消息 = 欢迎语 + 问题，且只 @ 一次
+        plugin.config["join_message_mode"] = "merge"
+        merge_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="70001")
+        await plugin.on_group_notice(merge_event)
+        merge_texts = texts_of(merge_event.sent)
+        check(len(merge_texts) == 1, f"merge 模式只发一条消息（实际 {len(merge_texts)}）")
+        check(
+            "欢迎加入本群" in merge_texts[0] and "请回答：1+1=?" in merge_texts[0],
+            "一条消息里同时含欢迎语与问题",
+        )
+        check(merge_texts[0].index("欢迎加入本群") < merge_texts[0].index("请回答"), "欢迎语排在问题之前")
+        check(mentions_of(merge_event.sent) == ["70001"], f"合并后只 @ 一次（{mentions_of(merge_event.sent)}）")
+
+        # 2) separate：先欢迎语、再问题，两条各 @ 一次
+        plugin.config["join_message_mode"] = "separate"
+        plugin.config["question_message"] = "{at} 请回答：{question}"
+        sep_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="70002")
+        await plugin.on_group_notice(sep_event)
+        sep_texts = texts_of(sep_event.sent)
+        check(len(sep_texts) == 2, f"separate 模式发两条消息（实际 {len(sep_texts)}）")
+        check("欢迎加入本群" in sep_texts[0] and "请回答" not in sep_texts[0], "第一条是纯欢迎语")
+        check("请回答" in sep_texts[1], "第二条是问题")
+        check(mentions_of(sep_event.sent) == ["70002", "70002"], "两条消息各自 @ 到新人")
+
+        # 3) question_only / 欢迎语留空：不发欢迎语
+        plugin.config["join_message_mode"] = "question_only"
+        only_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="70003")
+        await plugin.on_group_notice(only_event)
+        check(
+            len(texts_of(only_event.sent)) == 1 and "欢迎加入本群" not in texts_of(only_event.sent)[0],
+            "question_only：只发问题",
+        )
+        plugin.config["join_message_mode"] = "merge"
+        plugin.config["welcome_message"] = ""
+        empty_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="70004")
+        await plugin.on_group_notice(empty_event)
+        check("欢迎加入本群" not in chain_text(empty_event.sent[0]), "欢迎语留空时退化为只发问题")
+
+        # 4) 欢迎语里的占位符
+        plugin.config["welcome_message"] = "欢迎 {user} 来到群 {group}，{max_attempts} 次机会。问题：{question}"
+        placeholder_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="70005")
+        await plugin.on_group_notice(placeholder_event)
+        placeholder_text = chain_text(placeholder_event.sent[0])
+        check("{" not in placeholder_text.replace("{at}", ""), f"欢迎语占位符已全部渲染（{placeholder_text[:70]}…）")
+        check(
+            "123456" in placeholder_text and "3 次机会" in placeholder_text,
+            "{user}/{group}/{max_attempts} 渲染正确",
+        )
+        check("问题：1+1=?" in placeholder_text, "{question} 会插入题目本身")
+
+        # 5) 首次发言补发也带欢迎语；管理员 /审核 重审 不带
+        plugin.config["welcome_message"] = "🎉 {at} 欢迎加入本群！"
+        plugin.config["question_message"] = "请回答：{question}"
+        plugin.config["auto_enroll_on_speak"] = True
+        speak_event = FakeEvent(user_id="70006", text="大家好")
+        await plugin.on_group_message(speak_event)
+        check("欢迎加入本群" in chain_text(speak_event.sent[0]), "首次发言补发问题时也带欢迎语")
+
+        context.sent.clear()
+        renew_replies = [r async for r in plugin.review_retry(admin_event, "70006", "123456")]
+        renew_text = " ".join(texts_of(context.sent))
+        check("欢迎加入本群" not in renew_text, "/审核 重审 不重复发欢迎语（只补问题）")
+        check("已重置" in chain_text(renew_replies[0]), "/审核 重审 仍有回执")
+
+        print("\n[21] Pages 资源结构")
         pages = {
             "settings": ("index.html", "app.js", "settings.js", "style.css"),
             "questions": ("index.html", "app.js", "bank.js", "style.css"),
