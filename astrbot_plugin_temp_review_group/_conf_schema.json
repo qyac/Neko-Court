@@ -344,6 +344,30 @@
     "hint": "开启后，网页审核通过的人进群时不再提问，直接私发当日验证码；关闭则仍按正常流程提问。",
     "default": true
   },
+  "web_site_enabled": {
+    "type": "bool",
+    "description": "内置审核网站（随插件运行）",
+    "hint": "打开后，插件启动时会自己在后台跑起审核网站，无需再单独部署；验证码/规则会自动同步过去，不用填 url 与 token。端口与监听地址见下面两项。",
+    "default": false
+  },
+  "web_site_host": {
+    "type": "string",
+    "description": "内置站点监听地址",
+    "hint": "127.0.0.1 = 只有本机能访问（配合反向代理用）；想让群友直接访问就填 0.0.0.0 并放行端口。",
+    "default": "127.0.0.1"
+  },
+  "web_site_port": {
+    "type": "int",
+    "description": "内置站点端口",
+    "hint": "申请页地址就是 http://<机器IP>:<这个端口>/，管理后台在后面加 /admin。被占用时日志会提示改这里。",
+    "default": 8787
+  },
+  "web_site_trust_proxy": {
+    "type": "bool",
+    "description": "内置站点信任反向代理",
+    "hint": "放在 nginx/caddy 后面时打开：只有这时才读 X-Forwarded-For（否则客户端可以伪造 IP 绕过限流）。直接对外暴露时保持关闭。",
+    "default": false
+  },
   "code_length": {
     "type": "int",
     "description": "验证码长度",

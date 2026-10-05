@@ -28,6 +28,8 @@ import json
 import random
 import re
 import secrets
+import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -58,7 +60,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.6"
+PLUGIN_VERSION = "v1.1.7"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -112,6 +114,9 @@ BILI_RETRY_DELAY = 1.0
 # 网页审核对接：一次最多拉取多少条"网页已通过"记录
 WEB_REVIEW_PULL_LIMIT = 50
 WEB_REVIEW_TIMEOUT = 15.0
+# 内置站点绑定端口的重试次数与间隔（Windows 上端口刚释放时容易失败）
+WEB_SITE_BIND_ATTEMPTS = 5
+WEB_SITE_BIND_DELAY = 0.5
 _BILI_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})(?!\d)", re.I)
 _BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})(?!\d)")
 _BILI_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,10})(?!\d)")
@@ -179,6 +184,11 @@ HELP_TEXT = """📖 临时审核群管理
 · /审核 诊断        排查「新人入群没收到消息」：事件计数、配置、发送自检
 · /审核 查UID <UID> 查询 B站 UID 的昵称/等级/粉丝、是否满足规则、绑定情况
 · /审核 解绑 <UID>  清除 UID↔QQ 绑定（解除「一个 UID 只能绑一个 QQ」的限制）
+· /审核 网站        审核网站状态（内置/独立、地址、同步情况）
+· /审核 网站 同步   立刻同步一次（推送验证码/规则并拉取网页通过名单）
+· /审核 网站 地址   给出可以发给群友的申请页地址
+· /审核 网站 token  显示对接 token（改用独立部署时才需要）
+· /审核 网站 密码 <新密码>  重置内置站点的管理后台密码
 · /审核 重置码      立即重新生成验证码
 · /审核 设定码 <码> 手动设定验证码
 · /审核 放行 <QQ> [群号]   手动放行并下发验证码
@@ -260,6 +270,13 @@ class TempReviewGroup(Star):
         self._group_code_notice_logged = False
         self._private_leak_warned = False
         self._bili_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        # 内置审核网站（随插件启动的后台线程）
+        self._site_server: Any = None
+        self._site_thread: Any = None
+        self._site_store: Any = None
+        self._site_bound_port: int = 0
+        self._site_token: str = ""
+        self._site_error: str = ""
         # 运行期诊断信息（不落盘，重载后清零）：用于回答"为什么没给新人发消息"
         self._diag: dict[str, Any] = {
             "counters": {},
@@ -275,6 +292,9 @@ class TempReviewGroup(Star):
         """插件被激活时调用。"""
         self._ensure_ready()
         self._register_web_apis()
+        if self._site_builtin_enabled():
+            # 内置站点要在后台循环之前起来：循环里的同步/拉取会直接用它
+            await self._start_builtin_site()
         self._warn_config()
         logger.info(
             "[审核群] 插件已加载，审核群：%s",
@@ -296,6 +316,7 @@ class TempReviewGroup(Star):
                 logger.exception("[审核群] 后台任务退出时出现异常")
         self._loops.clear()
         self._jobs.clear()
+        self._stop_builtin_site()
         self._save_state()
 
     # ------------------------------------------------------------------ 初始化辅助
@@ -361,7 +382,7 @@ class TempReviewGroup(Star):
             return
         self._loops.append(asyncio.create_task(self._code_loop(), name="temp-review-code"))
         self._loops.append(asyncio.create_task(self._cleanup_loop(), name="temp-review-cleanup"))
-        if self._bool("web_review_enabled", False) and self._web_review_url():
+        if self._web_review_enabled():
             self._loops.append(asyncio.create_task(self._web_review_loop(), name="temp-review-web"))
 
     def _spawn(self, coro: Any) -> None:
@@ -919,6 +940,162 @@ class TempReviewGroup(Star):
             return  # 这是给某个指令的消息，交给指令处理
         await self._judge_answer(event, group_id, user_id, text)
 
+    # ------------------------------------------------------------------ 内置审核网站
+
+    def _site_builtin_enabled(self) -> bool:
+        return self._bool("web_site_enabled", False)
+
+    def _site_host(self) -> str:
+        return str(self._get("web_site_host", "127.0.0.1") or "127.0.0.1").strip()
+
+    def _site_port(self) -> int:
+        return self._int("web_site_port", 8787, minimum=1)
+
+    def _site_trust_proxy(self) -> bool:
+        return self._bool("web_site_trust_proxy", False)
+
+    def _site_running(self) -> bool:
+        return self._site_server is not None
+
+    def _site_data_dir(self) -> Path:
+        """站点数据与插件状态文件放在同一个插件数据目录下，便于整体备份。"""
+        base = Path(self._state_path).parent if self._state_path else Path(".")
+        return base / "review-web"
+
+    def _site_base_url(self) -> str:
+        host = self._site_host()
+        shown = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+        return f"http://{shown}:{self._site_bound_port or self._site_port()}"
+
+    @staticmethod
+    def _local_ip_addresses() -> list[str]:
+        """本机可被局域网访问的 IPv4（用于告诉管理员把哪个地址发给群友）。"""
+        ips: list[str] = []
+        try:
+            import socket
+
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ip = str(info[4][0])
+                if ip not in ips and not ip.startswith("127."):
+                    ips.append(ip)
+            probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                probe.connect(("223.5.5.5", 80))  # 只为拿到默认出口 IP，不实际发包
+                ip = probe.getsockname()[0]
+                if ip not in ips:
+                    ips.insert(0, ip)
+            finally:
+                probe.close()
+        except Exception:
+            pass
+        return ips[:5]
+
+    @staticmethod
+    def _load_review_web() -> Any:
+        """导入内置站点实现（与独立部署共用同一份代码）。"""
+        plugin_dir = str(Path(__file__).resolve().parent)
+        if plugin_dir not in sys.path:
+            sys.path.insert(0, plugin_dir)
+        import review_web  # noqa: PLC0415
+
+        return review_web
+
+    async def _start_builtin_site(self) -> bool:
+        """在后台线程里跑起内置审核网站。"""
+        if self._site_server is not None:
+            return True
+        try:
+            self._load_review_web()
+            from review_web import app as site_app  # noqa: PLC0415
+            from review_web.cli import ensure_defaults  # noqa: PLC0415
+            from review_web.store import Store  # noqa: PLC0415
+        except Exception as exc:
+            self._site_error = f"无法加载内置站点实现（{exc}）"
+            logger.error("[审核群] %s", self._site_error)
+            return False
+        try:
+            data_dir = self._site_data_dir()
+            data_dir.mkdir(parents=True, exist_ok=True)
+            store = Store(data_dir / "review-site.db")
+            token = self._web_review_token() or str(store.get_setting("plugin_token") or "") or secrets.token_urlsafe(24)
+            store.set_setting("plugin_token", token)
+            created = ensure_defaults(store, plugin_token=token)
+            # 端口可能刚被上一个进程释放（TIME_WAIT）或正在被占用：重试几次再放弃，
+            # 否则插件重载时站点会偶发启动失败。
+            server = None
+            last_error: Exception | None = None
+            for attempt in range(WEB_SITE_BIND_ATTEMPTS):
+                try:
+                    server = site_app.make_server(
+                        host=self._site_host(),
+                        port=self._site_port(),
+                        store=store,
+                        trust_proxy=self._site_trust_proxy(),
+                    )
+                    break
+                except OSError as exc:
+                    last_error = exc
+                    if attempt + 1 < WEB_SITE_BIND_ATTEMPTS:
+                        await asyncio.sleep(WEB_SITE_BIND_DELAY)
+            if server is None:
+                self._site_error = (
+                    f"端口 {self._site_port()} 监听失败（{last_error}），"
+                    "请改 web_site_port（或被占用的程序退出后重载插件）"
+                )
+                logger.error("[审核群] 内置审核网站启动失败：%s", self._site_error)
+                return False
+        except OSError as exc:
+            self._site_error = f"端口 {self._site_port()} 监听失败（{exc}），请改 web_site_port"
+            logger.error("[审核群] 内置审核网站启动失败：%s", self._site_error)
+            return False
+        except Exception as exc:
+            self._site_error = f"内置审核网站初始化失败（{exc}）"
+            logger.exception("[审核群] %s", self._site_error)
+            return False
+        thread = threading.Thread(target=server.serve_forever, name="temp-review-site", daemon=True)
+        thread.start()
+        self._site_server, self._site_thread, self._site_store = server, thread, store
+        self._site_bound_port = int(server.server_address[1])
+        self._site_token = token
+        self._site_error = ""
+        if created.get("admin_password"):
+            logger.warning(
+                "[审核群] 内置审核网站已启动：%s （首次生成的管理员密码：%s，登录后请修改）",
+                self._site_base_url(),
+                created["admin_password"],
+            )
+        else:
+            logger.info("[审核群] 内置审核网站已启动：%s（管理员密码沿用已有设置）", self._site_base_url())
+        return True
+
+    def _stop_builtin_site(self) -> None:
+        server = self._site_server
+        if server is not None:
+            try:
+                server.shutdown()
+                server.server_close()
+                logger.info("[审核群] 内置审核网站已停止。")
+            except Exception:
+                logger.exception("[审核群] 停止内置审核网站时出错")
+        self._site_server = None
+        self._site_thread = None
+        self._site_store = None
+        self._site_bound_port = 0
+
+    def _reset_site_password(self, password: str) -> bool:
+        """重置内置站点的管理员密码（站点自己的登录密码，与 AstrBot 账号无关）。"""
+        if self._site_store is None:
+            return False
+        try:
+            self._load_review_web()
+            from review_web.app import hash_password  # noqa: PLC0415
+
+            self._site_store.set_setting("admin_password_hash", hash_password(password))
+            return True
+        except Exception:
+            logger.exception("[审核群] 重置内置站点密码失败")
+            return False
+
     # ------------------------------------------------------------------ 网页审核对接
 
     def _web_review_url(self) -> str:
@@ -932,7 +1109,15 @@ class TempReviewGroup(Star):
     def _web_review_token(self) -> str:
         return str(self._get("web_review_token", "") or "").strip()
 
+    def _web_review_target(self) -> tuple[str, str]:
+        """同步目标：内置站点优先（同一进程、无需配置 url/token），否则用配置里的独立站点。"""
+        if self._site_server is not None:
+            return self._site_base_url(), self._site_token
+        return self._web_review_url(), self._web_review_token()
+
     def _web_review_enabled(self) -> bool:
+        if self._site_server is not None:
+            return True
         return self._bool("web_review_enabled", False) and bool(self._web_review_url()) and bool(self._web_review_token())
 
     def _web_review_poll_seconds(self) -> int:
@@ -1005,7 +1190,7 @@ class TempReviewGroup(Star):
                 bindings[str(uid)] = str(record["qq"])
         stats = self._web_review_status()
         return {
-            "token": self._web_review_token(),
+            "token": self._web_review_target()[1],
             "code": str(self._state.get("code") or ""),
             "code_expire": self._expire_text(),
             "groups": self._review_groups(),
@@ -1025,8 +1210,8 @@ class TempReviewGroup(Star):
     async def _web_review_sync(self) -> tuple[bool, str]:
         """把当前的验证码/规则/绑定推给审核网站。"""
         if not self._web_review_enabled():
-            return False, "未启用（web_review_enabled=false 或缺 url/token）"
-        url = f"{self._web_review_url()}/api/plugin/sync"
+            return False, "未启用（内置站点未运行，且 web_review_enabled=false 或缺 url/token）"
+        url = f"{self._web_review_target()[0]}/api/plugin/sync"
         try:
             data = await self._http_json("POST", url, payload=self._web_review_snapshot())
         except Exception as exc:
@@ -1042,9 +1227,9 @@ class TempReviewGroup(Star):
         """拉取"网页已通过"名单并写入本地 approved，然后 ack（幂等）。"""
         if not self._web_review_enabled():
             return 0, "未启用"
-        base = self._web_review_url()
+        base, target_token = self._web_review_target()
         # token 走请求头，不放进 URL（URL 会进浏览器历史/反代与站点日志）
-        auth = {"X-Review-Token": self._web_review_token()}
+        auth = {"X-Review-Token": target_token}
         try:
             data = await self._http_json(
                 "GET",
@@ -1104,7 +1289,7 @@ class TempReviewGroup(Star):
                 "POST",
                 f"{base}/api/plugin/ack",
                 headers=auth,
-                payload={"token": self._web_review_token(), "ids": acked},
+                payload={"token": target_token, "ids": acked},
             )
         except Exception as exc:
             # 没 ack 成功不要紧：下一轮会重复拉到，写入是幂等的
@@ -2161,41 +2346,91 @@ class TempReviewGroup(Star):
 
     @review_cmd.command("网站")
     async def review_website(self, event: AstrMessageEvent, action: str = ""):
-        """查看/手动同步审核网站：/审核 网站 [同步]"""
+        """审核网站：/审核 网站 [同步|地址|token|密码 <新密码>]"""
         if not await self._check_admin(event):
-            yield event.plain_result("⛔ 只有管理员可以查看网页审核对接状态。")
+            yield event.plain_result("⛔ 只有管理员可以管理审核网站。")
             return
-        if not self._bool("web_review_enabled", False):
+        argument = action.strip()
+        keyword, _, rest = argument.partition(" ")
+        keyword = keyword.strip()
+
+        if keyword in {"密码", "改密"}:
+            password = rest.strip()
+            if len(password) < 8:
+                yield event.plain_result("用法：/审核 网站 密码 <至少8位的新密码>")
+                return
+            if not self._site_running():
+                yield event.plain_result(
+                    "⚠️ 内置站点没有在运行，改密无效。"
+                    "若你在用独立部署的站点，请在那个站点的后台里改密码。"
+                )
+                return
+            if not self._reset_site_password(password):
+                yield event.plain_result("❌ 改密失败，详见日志。")
+                return
+            yield event.plain_result("✅ 内置审核网站的管理员密码已更新。")
+            return
+
+        if keyword in {"地址", "链接", "url"}:
+            if not self._site_running():
+                yield event.plain_result("⚠️ 内置站点没有在运行。")
+                return
+            lines = [f"🌐 把下面这个地址发给群友（管理后台加 /admin）：", f"· {self._site_base_url()}/"]
+            for ip in self._local_ip_addresses():
+                lines.append(f"· http://{ip}:{self._site_bound_port}/")
+            if self._site_host() == "127.0.0.1":
+                lines.append("提示：现在只监听 127.0.0.1，局域网/外网打不开；把 web_site_host 改成 0.0.0.0 并放行端口。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        if keyword in {"token", "密钥"}:
+            if not self._site_running():
+                yield event.plain_result("⚠️ 内置站点没有在运行。")
+                return
             yield event.plain_result(
-                "🌐 网页审核对接未启用。\n"
-                "在插件配置里打开 web_review_enabled，并填好 web_review_url 与 web_review_token"
-                "（token 在审核网站启动时打印）。"
+                "🔑 内置站点的对接 token（只有改用独立部署时才需要它）：\n"
+                f"{self._site_token}\n"
+                "独立部署时把它填到 web_review_token，并把 web_review_url 指向那个站点。"
             )
             return
-        if not self._web_review_url() or not self._web_review_token():
-            yield event.plain_result("⚠️ 已启用网页审核，但 web_review_url 或 web_review_token 没填。")
+
+        if not self._web_review_enabled():
+            if self._site_builtin_enabled() and self._site_error:
+                yield event.plain_result(f"❌ 内置审核网站启动失败：{self._site_error}")
+                return
+            yield event.plain_result(
+                "🌐 审核网站未启用。两种开启方式：\n"
+                "· 内置（推荐）：打开 web_site_enabled，插件会自己把站点跑起来，无需填 url/token；\n"
+                "· 独立：打开 web_review_enabled 并填好 web_review_url 与 web_review_token。"
+            )
             return
-        if action.strip() in {"同步", "sync", "拉取"}:
+
+        if keyword in {"同步", "sync", "拉取"}:
             yield event.plain_result("🔄 正在同步（推送验证码/规则，并拉取网页已通过名单）…")
             synced, pulled, note = await self._web_review_once()
             yield event.plain_result(("✅ " if synced else "❌ ") + note)
             return
+
         status = self._web_review_status()
         last_sync = float(status.get("last_sync_at") or 0)
         last_pull = float(status.get("last_pull_at") or 0)
-        lines = [
-            "🌐 网页审核对接",
-            f"站点：{self._web_review_url()}",
-            f"轮询间隔：{self._web_review_poll_seconds()} 秒 ｜ 自动发码：{'开' if self._bool('web_review_auto_approve', True) else '关'}",
+        lines = ["🌐 审核网站"]
+        if self._site_running():
+            lines.append(f"模式：内置（随插件运行）｜ {self._site_base_url()}/  管理后台 {self._site_base_url()}/admin")
+            lines.append(f"监听：{self._site_host()}:{self._site_port()} ｜ 反代信任：{'开' if self._site_trust_proxy() else '关'}")
+            lines.append(f"站点数据：{self._site_store.path if self._site_store else '（不可用）'}")
+        else:
+            lines.append(f"模式：独立站点 ｜ {self._web_review_url()}")
+        lines.append(f"轮询间隔：{self._web_review_poll_seconds()} 秒 ｜ 自动发码：{'开' if self._bool('web_review_auto_approve', True) else '关'}")
+        lines.append(
             f"最近同步：{self._fmt_ts(last_sync) if last_sync else '尚未成功同步'}"
-            + (f"（{self._humanize(time.time() - last_sync)}前）" if last_sync else ""),
-            f"最近拉取：{self._fmt_ts(last_pull) if last_pull else '尚未拉取'}"
-            f" ｜ 累计接收 {int(status.get('pulled') or 0)} 条",
-            f"网站端待投递：{int(status.get('pending_deliveries') or 0)} 条",
-        ]
+            + (f"（{self._humanize(time.time() - last_sync)}前）" if last_sync else "")
+        )
+        lines.append(f"最近拉取：{self._fmt_ts(last_pull) if last_pull else '尚未拉取'} ｜ 累计接收 {int(status.get('pulled') or 0)} 条")
+        lines.append(f"网站端待投递：{int(status.get('pending_deliveries') or 0)} 条")
         if status.get("last_error"):
             lines.append(f"⚠️ 最近错误：{status['last_error']}")
-        lines.append("提示：/审核 网站 同步 可以立刻同步一次。")
+        lines.append("其它用法：/审核 网站 同步 ｜ 地址 ｜ token ｜ 密码 <新密码>")
         yield event.plain_result("\n".join(lines))
 
     @review_cmd.command("清理")

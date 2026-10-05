@@ -5,7 +5,7 @@
  * 只使用 Node 标准库，运行方式：
  *   "C:\Users\haoxu\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe" selftest_review_site_ui.mjs
  *
- * 说明：Node 会把没有 package.json 的 .js 当 CJS，因此先把 review-site/static/form.js
+ * 说明：Node 会把没有 package.json 的 .js 当 CJS，因此先把 review_web/static/form.js
  * 复制到系统临时目录下的 form-under-test.mjs，再动态 import，用完删除。
  */
 
@@ -16,7 +16,7 @@ import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const SITE_DIR = path.join(ROOT, "review-site");
+const SITE_DIR = path.join(ROOT, "astrbot_plugin_temp_review_group", "review_web");
 const TEMPLATE_DIR = path.join(SITE_DIR, "templates");
 const STATIC_DIR = path.join(SITE_DIR, "static");
 

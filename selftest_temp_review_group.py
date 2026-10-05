@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.6",
+            version="v1.1.7",
             desc="自检用元数据",
         )
 
@@ -2066,10 +2066,11 @@ async def main():
         plugin.config["web_review_enabled"] = True
         plugin.config["web_review_token"] = ""
         no_token = chain_text([r async for r in plugin.review_website(admin_event)][0])
-        check("没填" in no_token, "指令：缺 token 时告警")
+        check("未启用" in no_token and "两种开启方式" in no_token, "指令：都没启用时给出两种开启方式")
         plugin.config["web_review_token"] = "tok-test"
         status_text = chain_text([r async for r in plugin.review_website(admin_event)][0])
-        check("网页审核对接" in status_text and "127.0.0.1:8787" in status_text, "指令：显示站点与状态")
+        check("审核网站" in status_text and "127.0.0.1:8787" in status_text, "指令：显示站点与状态")
+        check("模式：独立站点" in status_text, "指令：标明当前是独立站点模式")
         check("累计接收" in status_text, "指令：显示累计接收条数")
         responses[("POST", "api/plugin/sync")] = {"ok": True, "pending_deliveries": 0}
         responses[("GET", "api/plugin/applications")] = {"ok": True, "count": 0, "items": []}
@@ -2104,15 +2105,15 @@ async def main():
         reset_review(review_mode="rule")
 
         print("\n[23] 端到端联调：真实站点 + 真实 HTTP")
-        site_root = PLUGIN_MAIN.parent.parent / "review-site"
+        plugin_dir = PLUGIN_MAIN.parent
+        site_root = plugin_dir / "review_web"
         if not site_root.is_dir():
-            # 单独校验插件包时（解压 zip）不会有 review-site，跳过而不是判失败
-            print(f"  SKIP  未找到审核站点目录（{site_root}），跳过端到端联调")
+            print(f"  SKIP  未找到站点实现目录（{site_root}），跳过端到端联调")
         else:
-            sys.path.insert(0, str(site_root))
-            import app as site_app  # noqa: E402
-            import bili as site_bili  # noqa: E402
-            from store import Store as SiteStore  # noqa: E402
+            sys.path.insert(0, str(plugin_dir))
+            from review_web import app as site_app  # noqa: E402
+            from review_web import bili as site_bili  # noqa: E402
+            from review_web.store import Store as SiteStore  # noqa: E402
             import threading  # noqa: E402
             import urllib.request  # noqa: E402
 
@@ -2223,7 +2224,103 @@ async def main():
                 plugin._state["bili_uids"] = {}
                 reset_review(review_mode="rule")
 
-        print("\n[24] Pages 资源结构")
+        print("\n[24] 内置审核网站（随插件启动）")
+        import socket as _socket  # noqa: E402
+        import urllib.request as _urlreq  # noqa: E402
+
+        def free_port() -> int:
+            probe = _socket.socket()
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+            probe.close()
+            return port
+
+        def site_get(url: str) -> tuple[int, str]:
+            try:
+                with _urlreq.urlopen(url, timeout=10) as response:
+                    return response.status, response.read().decode("utf-8", "replace")
+            except Exception as exc:
+                return 0, f"{type(exc).__name__}: {exc}"
+
+        plugin.config["web_review_enabled"] = False
+        plugin.config["web_review_url"] = ""
+        plugin.config["web_review_token"] = ""
+        plugin.config["web_site_enabled"] = True
+        plugin.config["web_site_host"] = "127.0.0.1"
+        port = free_port()
+        plugin.config["web_site_port"] = port
+
+        check(plugin._site_builtin_enabled() and not plugin._site_running(), "未启动时状态正确")
+        check(await plugin._start_builtin_site(), f"内置站点启动成功（端口 {port}，{plugin._site_error or 'ok'}）")
+        check(plugin._site_running() and plugin._site_bound_port == port, "记录运行状态与端口")
+        status, body = site_get(f"http://127.0.0.1:{port}/healthz")
+        check(status == 200 and '"ok"' in body, f"真实 HTTP 健康检查通过（{status}）")
+        status, body = site_get(f"http://127.0.0.1:{port}/")
+        check(status == 200 and "入群审核" in body, "申请页可以直接打开")
+        check(
+            plugin._state_path and str(plugin._site_store.path).startswith(str(Path(plugin._state_path).parent)),
+            f"站点数据放在插件数据目录下（{plugin._site_store.path.name}）",
+        )
+
+        # 内置模式下无需配置 url/token 也能对接
+        check(plugin._web_review_enabled(), "内置模式下自动视为已启用（无需 url/token）")
+        target_url, target_token = plugin._web_review_target()
+        check(target_url == f"http://127.0.0.1:{port}" and bool(target_token), f"同步目标自动指向内置站点（{target_url}）")
+
+        plugin._state["code"] = "BUILTIN1"
+        synced, pulled, note = await plugin._web_review_once()
+        check(synced, f"插件向内置站点同步成功（{note}）")
+        check(plugin._site_store.get_setting("plugin_code") == "BUILTIN1", "内置站点收到了验证码")
+
+        # 指令：内置状态 / 地址 / token / 密码
+        status_text = chain_text([r async for r in plugin.review_website(admin_event)][0])
+        check("模式：内置" in status_text and f"127.0.0.1:{port}" in status_text, "指令显示内置模式与地址")
+        check("站点数据" in status_text, "指令显示站点数据文件")
+        addr_text = chain_text([r async for r in plugin.review_website(admin_event, "地址")][0])
+        check("发给群友" in addr_text and f"http://127.0.0.1:{port}/" in addr_text, "地址子命令给出可分享链接")
+        token_text = chain_text([r async for r in plugin.review_website(admin_event, "token")][0])
+        check(target_token in token_text, "token 子命令给出对接 token")
+        short_pw = chain_text([r async for r in plugin.review_website(admin_event, "密码 123")][0])
+        check("至少8位" in short_pw, "密码太短时给出用法")
+        pw_text = chain_text([r async for r in plugin.review_website(admin_event, "密码 newpass-123456")][0])
+        check("已更新" in pw_text, "改密子命令执行成功")
+        login_body = json.dumps({"password": "newpass-123456"}).encode()
+        request = _urlreq.Request(
+            f"http://127.0.0.1:{port}/api/admin/login",
+            data=login_body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _urlreq.urlopen(request, timeout=10) as response:
+            check(response.status == 200 and "review_admin" in str(response.headers.get("Set-Cookie")), "用新密码能在内置站点登录")
+
+        # 端口冲突：给出可操作的报错而不是崩掉
+        plugin._stop_builtin_site()
+        check(not plugin._site_running(), "停止后状态复位")
+        blocker = _socket.socket()
+        # 注意：Windows 上 SO_REUSEADDR 会让"端口被占用"检测失效，这里故意不设
+        blocker.bind(("127.0.0.1", port))
+        blocker.listen(1)
+        try:
+            started = await plugin._start_builtin_site()
+            check(not started and "web_site_port" in plugin._site_error, f"端口被占用时报错并提示改端口（{plugin._site_error}）")
+        finally:
+            blocker.close()
+        check(await plugin._start_builtin_site(), "端口释放后可以重新启动")
+        check(plugin._site_running(), "重新启动后处于运行状态")
+
+        # 停止后再启动不会串端口
+        plugin._stop_builtin_site()
+        check(not plugin._site_running() and plugin._site_bound_port == 0, "停止后端口状态清空")
+        check(await plugin._start_builtin_site() and plugin._site_bound_port == port, "可以再次启动在同一端口")
+
+        # 收尾：清理
+        plugin._stop_builtin_site()
+        plugin.config["web_site_enabled"] = False
+        plugin.config["web_review_enabled"] = False
+        plugin._state["code"] = ""
+
+        print("\n[25] Pages 资源结构")
         pages = {
             "settings": ("index.html", "app.js", "settings.js", "style.css"),
             "questions": ("index.html", "app.js", "bank.js", "style.css"),

@@ -23,7 +23,9 @@ import zipfile
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent.parent
-SITE_DIR = WORKSPACE / "review-site"
+LAUNCHER_DIR = WORKSPACE / "review-site"
+# 实现放在插件里（内置模式与独立部署共用同一份代码）
+SITE_DIR = WORKSPACE / "astrbot_plugin_temp_review_group" / "review_web"
 DEFAULT_OUT_DIR = WORKSPACE / "dist"
 PACKAGE_NAME = "neko-court-review-site"
 FIXED_TIME = (2026, 1, 1, 0, 0, 0)
@@ -42,19 +44,21 @@ EXCLUDE_SUFFIXES = {".pyc", ".pyo", ".db", ".db-wal", ".db-shm", ".log"}
 
 # 分发时必须存在的文件
 REQUIRED = (
-    "VERSION",
     "serve.py",
-    "app.py",
-    "store.py",
-    "bili.py",
-    "render.py",
-    "README.md",
-    "templates/apply.html",
-    "templates/login.html",
-    "templates/admin.html",
-    "static/style.css",
-    "static/app.js",
-    "static/form.js",
+    "review_web/VERSION",
+    "review_web/__init__.py",
+    "review_web/cli.py",
+    "review_web/app.py",
+    "review_web/store.py",
+    "review_web/bili.py",
+    "review_web/render.py",
+    "review_web/README.md",
+    "review_web/templates/apply.html",
+    "review_web/templates/login.html",
+    "review_web/templates/admin.html",
+    "review_web/static/style.css",
+    "review_web/static/app.js",
+    "review_web/static/form.js",
 )
 
 
@@ -95,7 +99,11 @@ def plugin_version() -> str:
 
 
 def collect_files() -> list[tuple[Path, str]]:
+    """站点包 = 启动器（review-site/serve.py）+ 插件里的实现（review_web/）。"""
     items: list[tuple[Path, str]] = []
+    launcher = LAUNCHER_DIR / "serve.py"
+    if launcher.is_file():
+        items.append((launcher, "serve.py"))
     for path in sorted(SITE_DIR.rglob("*")):
         if path.is_dir():
             continue
@@ -104,7 +112,7 @@ def collect_files() -> list[tuple[Path, str]]:
             continue
         if path.name in EXCLUDE_FILES or path.suffix.lower() in EXCLUDE_SUFFIXES:
             continue
-        items.append((path, rel.as_posix()))
+        items.append((path, f"review_web/{rel.as_posix()}"))
     return items
 
 

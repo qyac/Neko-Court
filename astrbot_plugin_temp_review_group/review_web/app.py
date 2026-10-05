@@ -32,9 +32,8 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-import bili
-import render
-from store import STATUSES, Store
+from . import bili, render
+from .store import STATUSES, Store
 
 def _site_version() -> str:
     """站点版本：读同目录的 VERSION 文件（与发布包文件名同源，避免两处对不上）。"""
@@ -476,7 +475,7 @@ class Handler(BaseHTTPRequestHandler):
     def _page_admin(self) -> None:
         settings = self.settings()
         session = self._session()
-        if not self.app.admin_password_hash:
+        if not self._stored_password_hash():
             self._html(
                 200,
                 render.render_login(
@@ -678,6 +677,18 @@ class Handler(BaseHTTPRequestHandler):
     def _session(self) -> dict[str, Any] | None:
         return self.app.get_session(self._token())
 
+    def _stored_password_hash(self) -> str:
+        """取管理员密码哈希：**始终以数据库为准**。
+
+        插件内置模式下改密是直接写数据库的，而 App 上的缓存是启动时的旧值；
+        如果只看缓存，改完密码仍然只能用旧密码登录。
+        """
+        stored = str(self.store.get_setting("admin_password_hash") or "")
+        if stored:
+            self.app.admin_password_hash = stored
+            return stored
+        return str(self.app.admin_password_hash or "")
+
     def _require_admin(self, *, csrf: str | None = None) -> dict[str, Any] | None:
         """校验登录；`csrf` 传字符串时**必须**匹配（传空串也算校验失败，不能靠省略字段绕过）。"""
         session = self._session()
@@ -701,7 +712,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(429, "登录尝试过于频繁，请稍后再试")
         payload = self._body()
         password = str(payload.get("password") or "")
-        stored = self.app.admin_password_hash or str(self.store.get_setting("admin_password_hash") or "")
+        stored = self._stored_password_hash()
         if not stored or not verify_password(password, stored):
             self.store.log("login_failed", actor=f"ip:{ip}", detail="")
             if not self._is_json_request():
@@ -834,7 +845,7 @@ class Handler(BaseHTTPRequestHandler):
             if len(password) < 8:
                 return self._error(400, "管理员密码至少 8 位")
             self.store.set_setting("admin_password_hash", hash_password(password))
-            self.app.admin_password_hash = str(self.store.get_setting("admin_password_hash"))
+            self.app.admin_password_hash = str(self.store.get_setting("admin_password_hash") or "")
             # 改密码通常意味着怀疑泄露：把其它会话全部踢掉（保留当前这个）
             revoked = self.app.drop_other_sessions(self._token())
             self.store.log("password_changed", actor="admin", detail=f"revoked_sessions={revoked}")

@@ -62,6 +62,16 @@ export const FIELD_GROUPS = [
     ],
   },
   {
+    id: "site",
+    title: "内置审核网站",
+    keys: [
+      "web_site_enabled",
+      "web_site_host",
+      "web_site_port",
+      "web_site_trust_proxy",
+    ],
+  },
+  {
     id: "code",
     title: "验证码",
     keys: [

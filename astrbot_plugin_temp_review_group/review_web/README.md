@@ -1,6 +1,9 @@
 # 临时审核群 · 审核网站
 
-一个可以独立运行的**入群审核网站**：申请人在网页上填 QQ + B站 UID，站点核验 B站 账号后**直接把当日验证码显示在网页上**；
+一个**入群审核网站**：可以**内置在插件里随插件运行**（推荐，装一个插件就有网站），
+也可以用仓库里的 `review-site/serve.py` 独立部署成单独进程（两种方式共用这一份实现）。
+
+：申请人在网页上填 QQ + B站 UID，站点核验 B站 账号后**直接把当日验证码显示在网页上**；
 管理员在 `/admin` 看队列、手动通过/拒绝/拉黑、导出 CSV、改规则与站点设置。
 
 - **零第三方依赖**：只用 Python 标准库（`http.server` + `sqlite3` + `urllib`），不需要 Flask/Django/Node。
@@ -28,7 +31,22 @@
 
 站点侧只做**核验与展示**，验证码的生成与轮换始终在插件里，两边永远只有一份码。
 
-## 快速开始
+## 方式一：内置（推荐）
+
+在 AstrBot 插件配置里打开这三项即可，**不需要单独部署、也不需要填 url/token**：
+
+| 配置 | 建议值 |
+| --- | --- |
+| `web_site_enabled` | 打开 |
+| `web_site_host` | `127.0.0.1`（配反代）或 `0.0.0.0`（让群友直接访问） |
+| `web_site_port` | `8787` |
+| `web_site_trust_proxy` | 放在 nginx/caddy 后面时打开 |
+
+插件启动时会在后台线程里把站点跑起来，并**自动**把验证码/规则同步过去；首次启动的管理员密码会打印在 AstrBot 日志里。
+QQ 里用 `/审核 网站` 看状态与地址、`/审核 网站 地址` 拿可分享链接、`/审核 网站 密码 <新密码>` 改后台密码。
+站点数据放在 `<AstrBot>/data/plugin_data/astrbot_plugin_temp_review_group/review-web/review-site.db`（与插件状态文件同目录，一起备份即可）。
+
+## 方式二：独立部署
 
 ```bash
 # 1) 启动（首次会打印随机管理员密码与插件 token，只显示一次）
@@ -47,7 +65,7 @@ python review-site/serve.py --print-config
 
 - 申请页 `http://<地址>:8787/` —— 把这个链接发到群里/公告里；
 - 管理后台 `http://<地址>:8787/admin` —— 用管理员密码登录（首次登录后请改密码）；
-- 数据文件 `review-site/data/review-site.db`（SQLite，备份它即可）。
+- 数据文件：独立部署时在 `review_web/data/review-site.db`；内置模式在插件数据目录的 `review-web/review-site.db`。
 
 然后在 **AstrBot 插件配置**里填两项（插件侧配置 → 网页审核对接）：
 
@@ -113,7 +131,7 @@ python review-site/serve.py --print-config
 - 只保存：QQ 号、B站 UID、B站 公开昵称/等级/粉丝、备注、状态与原因、验证码、IP（用于限流与排查）、时间；
 - **申请人看不到别人的信息**：轮询用的是随机 32 位十六进制 ticket，无法枚举；"UID 已被使用"的错误里**不包含占用者的 QQ 号**；
 - UID 唯一性由数据库的**部分唯一索引**保证（只有 pending/approved 占用），被拒绝的人可以改 UID 再提交；
-- 想清理数据：直接在后台删除记录，或停服后删除 `review-site/data/review-site.db`。
+- 想清理数据：直接在后台删除记录，或停服后删除上面那个 `review-site.db`。
 
 ## 安全建议
 
@@ -185,7 +203,7 @@ Windows 上可以用 `pythonw.exe review-site/serve.py --host 0.0.0.0` 配合任
 ## 自检
 
 ```bash
-python selftest_review_site.py     # 149 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
+python selftest_review_site.py     # 151 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
 node   selftest_review_site_ui.mjs # 74 项：纯函数边界、模板契约、渲染模拟、脚本语法
 ```
 

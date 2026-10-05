@@ -25,17 +25,19 @@ import urllib.request
 from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent
-SITE_DIR = WORKSPACE / "review-site"
-sys.path.insert(0, str(SITE_DIR))
+PLUGIN_DIR = WORKSPACE / "astrbot_plugin_temp_review_group"
+# 站点实现在插件里（内置），独立部署只是换了个启动方式
+SITE_DIR = PLUGIN_DIR / "review_web"
+sys.path.insert(0, str(PLUGIN_DIR))
 
-import app as app_module  # noqa: E402
-import bili  # noqa: E402
-import render  # noqa: E402
-from store import Store  # noqa: E402
+from review_web import app as app_module  # noqa: E402
+from review_web import bili  # noqa: E402
+from review_web import render  # noqa: E402
+from review_web.store import Store  # noqa: E402
 
 PASSED = 0
 FAILED: list[str] = []
-DATA_DIR = WORKSPACE / ".selftest_data" / "review-site"
+DATA_DIR = WORKSPACE / ".selftest_data" / "review-web"
 
 
 def check(condition, label):
@@ -521,6 +523,18 @@ def main() -> int:
         for bad in ({"bili_min_level": ["a"]}, {"bili_min_fans": {"x": 1}}):
             st, data, _ = admin.json("/api/admin/settings", method="POST", payload={"csrf": csrf3, **bad}, cookie=admin.cookie)
             check(st == 400, f"脏输入 {list(bad)[0]} 返回 400（{st}）")
+
+        # 8.5) 外部（插件内置模式）直接改库里的密码后，登录要立刻用新密码
+        store.set_setting("admin_password_hash", app_module.hash_password("external-new-pass"))
+        fresh_client = Client(f"http://127.0.0.1:{port}")
+        server.app.login_limiter.reset("login:127.0.0.1")
+        status, data, _ = fresh_client.json("/api/admin/login", method="POST", payload={"password": "external-new-pass"})
+        check(status == 200, f"外部改密后新密码立刻可登录（{status}）")
+        status, data, _ = fresh_client.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        check(status == 401, "旧密码立刻失效")
+        # 复原，避免影响后面的用例
+        server.app.login_limiter.reset("login:127.0.0.1")
+        store.set_setting("admin_password_hash", app_module.hash_password("pw-12345678"))
 
         # 9) HTTPS 场景：Secure cookie + HSTS
         https_client = Client(f"http://127.0.0.1:{port}")
