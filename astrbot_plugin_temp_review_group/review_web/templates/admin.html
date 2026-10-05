@@ -195,6 +195,63 @@
       </div>
     </form>
   </section>
+
+  <section class="card" aria-labelledby="questions-title">
+    <h2 class="card-title" id="questions-title">题库（网页答题）</h2>
+
+    <details id="questions-panel" open>
+      <summary>展开 / 收起题库管理</summary>
+
+      <p class="hint" id="questions-status" role="status"
+         style="color:var(--text-muted);font-size:0.86rem">正在加载题库…</p>
+
+      <fieldset id="questions-global">
+        <legend>出题设置</legend>
+
+        <div class="checkbox">
+          <input id="ask-questions" type="checkbox" aria-describedby="ask-questions-hint">
+          <label for="ask-questions">网页答题总开关</label>
+        </div>
+        <p class="hint" id="ask-questions-hint" style="color:var(--text-muted);font-size:0.86rem">关闭后申请页不再要求答题；题库里没有可用题目时也会自动跳过答题。</p>
+
+        <div class="settings-grid">
+          <div class="field">
+            <label for="site-match-mode">站点题库默认匹配方式</label>
+            <select id="site-match-mode" aria-describedby="site-match-mode-hint"></select>
+            <p class="hint" id="site-match-mode-hint">题干里选择「跟随全局」的题目会使用这里的匹配方式；站点默认方式本身请选一个具体方式（「跟随全局」会由后端拒绝）。</p>
+          </div>
+          <div class="field">
+            <label for="site-fuzzy-threshold">模糊阈值（0.5~1.0）</label>
+            <input id="site-fuzzy-threshold" type="number" min="0.5" max="1" step="0.05"
+                   inputmode="decimal" aria-describedby="site-fuzzy-hint">
+            <p class="hint" id="site-fuzzy-hint">只在匹配方式为「模糊相似」时生效。</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <span class="section-title" id="site-common-label">站点通用答案库</span>
+          <div id="site-common-editor" aria-labelledby="site-common-label"></div>
+          <p class="hint" id="site-common-hint">通用答案对题库里的所有题目都算答对（可留空）。输入后按回车或点「添加」，点答案上的 ✕ 删除。</p>
+        </div>
+
+        <p class="hint" id="plugin-synced-at" style="color:var(--text-muted);font-size:0.86rem">插件题库同步时间：尚未同步</p>
+      </fieldset>
+
+      <h3 class="section-title" id="site-questions-title">站点题目</h3>
+      <div id="site-questions" aria-labelledby="site-questions-title"></div>
+
+      <div class="btn-row">
+        <button type="button" id="questions-refresh" class="btn btn-small">刷新题库</button>
+        <button type="button" id="question-add" class="btn btn-small">新增题目</button>
+        <button type="button" id="questions-clear" class="btn btn-small btn-danger">清空站点题库</button>
+      </div>
+      <p class="hint" style="color:var(--text-muted);font-size:0.86rem">站点题库为空时，网页会用插件同步过来的题目；也可以点「新增题目」自己加。</p>
+
+      <h3 class="section-title" id="plugin-questions-title">插件题目</h3>
+      <div id="plugin-questions" aria-labelledby="plugin-questions-title"></div>
+      <p class="hint" style="color:var(--text-muted);font-size:0.86rem">插件题库来自 QQ 插件（改它请到 AstrBot 插件配置），这一部分只读。</p>
+    </details>
+  </section>
 </main>
 
 <footer class="site-footer" id="site-footer">$footer_html</footer>

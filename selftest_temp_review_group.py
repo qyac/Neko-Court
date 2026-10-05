@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.8",
+            version="v1.1.9",
             desc="自检用元数据",
         )
 
@@ -1990,6 +1990,63 @@ async def main():
         check(snapshot["bindings"] == {"80000001": "90001"}, "快照带上 UID↔QQ 绑定")
         check(snapshot["bili"]["bili_min_level"] == 0 and "bili_on_error" in snapshot["bili"], "快照带上 B站 规则")
         check(snapshot["stats"]["pending"] == 1, "快照带上待审核/已通过统计")
+        check(isinstance(snapshot.get("questions"), list) and snapshot["questions"], "快照带上题库（网页可以出同样的题）")
+        check(
+            all({"enabled", "question", "hint", "answers", "match_mode"} <= set(item) for item in snapshot["questions"]),
+            "快照里的题目字段完整",
+        )
+        check(
+            "common_answers" in snapshot and "match_mode" in snapshot and "fuzzy_threshold" in snapshot,
+            "快照带上通用答案库与匹配方式",
+        )
+
+        # 网页端与插件的判定必须**逐字一致**，否则同一句话在 QQ 过、在网页不过
+        matching_dir = PLUGIN_MAIN.parent / "review_web"
+        if (matching_dir / "matching.py").is_file():
+            sys.path.insert(0, str(PLUGIN_MAIN.parent))
+            from review_web import matching as site_matching  # noqa: E402
+
+            matrix = [
+                ("我觉得是 2", ["2"], "contains"),
+                ("２", ["2"], "exact"),
+                ("2。", ["2"], "exact"),
+                ("我有三只猫", ["猫"], "contains"),
+                ("红烧肉呀", ["红烧肉"], "fuzzy"),
+                ("完全不相干", ["学习交流"], "fuzzy"),
+                ("abc123", [r"abc\d+"], "regex"),
+                ("xxx", ["["], "regex"),
+                ("", ["2"], "contains"),
+                ("   ", ["2"], "contains"),
+            ]
+            mismatches = []
+            for text, answers, mode in matrix:
+                plugin_pass, plugin_detail = plugin._match_with(text, answers, mode, 0.8)
+                site_pass, site_detail = site_matching.match_one(text, answers, mode, 0.8)
+                if (plugin_pass, plugin_detail) != (site_pass, site_detail):
+                    mismatches.append((text, answers, mode, plugin_detail, site_detail))
+            check(not mismatches, f"单题判定与网站逐字一致（{len(matrix)} 组）" + (f" 差异：{mismatches[:2]}" if mismatches else ""))
+
+            common_cases = [
+                ("我的邀请码1234", ["2"], ["邀请码1234"], "contains"),
+                ("这个不太对", ["甲"], ["乙"], "fuzzy"),
+                ("2", ["2"], [], "exact"),
+            ]
+            rule_mismatches = []
+            for text, answers, common, mode in common_cases:
+                plugin_pass, plugin_detail = plugin._evaluate_rules(text, answers, mode, common)
+                site_pass, site_detail = site_matching.evaluate(text, answers, mode, common, 0.8)
+                if (plugin_pass, plugin_detail) != (site_pass, site_detail):
+                    rule_mismatches.append((text, plugin_detail, site_detail))
+            check(
+                not rule_mismatches,
+                f"含通用答案库的判定也一致（{len(common_cases)} 组）" + (f" 差异：{rule_mismatches[:2]}" if rule_mismatches else ""),
+            )
+            check(
+                site_matching.normalize("　ＡＢＣ 。") == module._normalize_text("　ＡＢＣ 。"),
+                "归一化（全角/标点/空白）两边一致",
+            )
+        else:
+            print("  SKIP  没有 review_web，跳过匹配一致性对照")
 
         # 同步成功 / 失败
         responses[("POST", "api/plugin/sync")] = {"ok": True, "pending_deliveries": 2}
@@ -2150,10 +2207,30 @@ async def main():
                 with urllib.request.urlopen(request, timeout=20) as response:
                     return response.status, json.loads(response.read().decode("utf-8"))
 
+            # 网页现在会出题：固定题库，并按题作答
+            plugin.config["questions"] = [
+                {
+                    "__template_key": "question_item",
+                    "enabled": True,
+                    "question": "端到端测试题：1+1=?",
+                    "hint": "",
+                    "answers": ["2"],
+                    "match_mode": "inherit",
+                }
+            ]
+            plugin.config["common_answers"] = []
+            plugin.config["code_reset_time"] = "off"
+
             try:
-                status, body = site_post("/api/apply", {"qq": "91001", "uid": "82000001"})
+                status, body = site_post(
+                    "/api/apply",
+                    {"qq": "91001", "uid": "82000001", "question": "端到端测试题：1+1=?", "answer": "2"},
+                )
                 check(status == 200 and body["status"] == "approved", f"申请人在真实站点上提交并通过（{status}）")
-                status, body = site_post("/api/apply", {"qq": "91002", "uid": "82000002"})
+                status, body = site_post(
+                    "/api/apply",
+                    {"qq": "91002", "uid": "82000002", "question": "端到端测试题：1+1=?", "answer": "2"},
+                )
                 check(body["status"] == "approved", "第二位申请人也通过")
 
                 # 恢复插件的真实 HTTP 实现，让插件真的去访问站点
@@ -2179,7 +2256,10 @@ async def main():
                 check(site_store.get_setting("plugin_synced_at"), "站点记录了同步时间")
 
                 # 站点把验证码展示给后来提交的申请人
-                status, body = site_post("/api/apply", {"qq": "91003", "uid": "82000003"})
+                status, body = site_post(
+                    "/api/apply",
+                    {"qq": "91003", "uid": "82000003", "question": "端到端测试题：1+1=?", "answer": "2"},
+                )
                 check(body["code"] == "E2E001", f"网页直接显示插件同步来的验证码（{body['code']}）")
 
                 # 网页已通过者入群：不提问、直接发码
@@ -2272,9 +2352,56 @@ async def main():
         check(target_url == f"http://127.0.0.1:{port}" and bool(target_token), f"同步目标自动指向内置站点（{target_url}）")
 
         plugin._state["code"] = "BUILTIN1"
+        plugin.config["questions"] = [
+            {
+                "__template_key": "question_item",
+                "enabled": True,
+                "question": "内置站点测试题：1+1=?",
+                "hint": "数字",
+                "answers": ["2"],
+                "match_mode": "inherit",
+            }
+        ]
+        plugin.config["common_answers"] = []
         synced, pulled, note = await plugin._web_review_once()
         check(synced, f"插件向内置站点同步成功（{note}）")
         check(plugin._site_store.get_setting("plugin_code") == "BUILTIN1", "内置站点收到了验证码")
+        check(
+            plugin._site_store.get_setting("plugin_questions")
+            and plugin._site_store.get_setting("plugin_questions")[0]["question"] == "内置站点测试题：1+1=?",
+            "内置站点收到了题库",
+        )
+
+        # 走一遍真实网页流程：取题 → 带答案提交 → 通过
+        import urllib.request as _urlrequest  # noqa: E402
+
+        def site_post_json(path: str, payload: dict) -> tuple[int, dict]:
+            request = _urlrequest.Request(
+                f"http://127.0.0.1:{port}{path}",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with _urlrequest.urlopen(request, timeout=10) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8", "replace"))
+
+        status, question_body = site_get(f"http://127.0.0.1:{port}/api/questions")
+        fetched = json.loads(question_body) if status == 200 else {}
+        check(fetched.get("enabled") is True and fetched.get("question") == "内置站点测试题：1+1=?", "内置站点能取到插件同步的题")
+        check("2" not in json.dumps(fetched, ensure_ascii=False).replace("1+1=?", ""), "取题接口不下发答案")
+        status, applied = site_post_json(
+            "/api/apply",
+            {"qq": "95001", "uid": "97000001", "question": fetched.get("question"), "answer": "2"},
+        )
+        check(status == 200 and applied.get("status") == "approved", f"内置站点上答题通过（{status}/{applied.get('status')}）")
+        status, wrong = site_post_json(
+            "/api/apply",
+            {"qq": "95002", "uid": "97000002", "question": fetched.get("question"), "answer": "3"},
+        )
+        check(wrong.get("status") == "rejected" and "不正确" in str(wrong.get("reason")), "内置站点上答错被判不通过")
 
         # 指令：内置状态 / 地址 / token / 密码
         status_text = chain_text([r async for r in plugin.review_website(admin_event)][0])

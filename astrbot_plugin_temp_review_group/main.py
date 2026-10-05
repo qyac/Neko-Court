@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.8"
+PLUGIN_VERSION = "v1.1.9"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -1209,6 +1209,20 @@ class TempReviewGroup(Star):
                 "bili_on_error": self._bili_on_error(),
             },
             "bindings": dict(list(bindings.items())[:2000]),
+            # 题库也同步过去：网页默认就用插件这套题（网站后台也可以另配站点题库）
+            "questions": [
+                {
+                    "enabled": bool(item.get("enabled", True)),
+                    "question": str(item.get("question") or ""),
+                    "hint": str(item.get("hint") or ""),
+                    "answers": [str(answer) for answer in (item.get("answers") or [])],
+                    "match_mode": str(item.get("match_mode") or "inherit"),
+                }
+                for item in self._questions(include_disabled=True)
+            ],
+            "common_answers": self._common_answers(),
+            "match_mode": self._match_mode(),
+            "fuzzy_threshold": self._fuzzy_threshold(),
             "stats": {"pending": len(self._state.get("pending") or {}), "approved": len(self._state.get("approved") or {})},
             "pulled": int(stats.get("pulled") or 0),
         }
@@ -2015,6 +2029,8 @@ class TempReviewGroup(Star):
                 f"网页审核：✅ 已启用 ｜ {self._web_review_url() or '（未填 url）'} ｜ "
                 f"轮询 {self._web_review_poll_seconds()} 秒 ｜ 累计接收 {int(status.get('pulled') or 0)} 条"
             )
+            usable_questions = [item for item in self._questions() if self._question_usable(item)]
+            lines.append(f"· 已同步题库 {len(self._questions(include_disabled=True))} 条（可用 {len(usable_questions)} 条）给网站出题")
             if not status.get("last_sync_at"):
                 lines.append("· 还没成功同步过：检查 web_review_url / web_review_token，或网络是否可达")
             elif status.get("last_error"):
@@ -2434,6 +2450,12 @@ class TempReviewGroup(Star):
         )
         lines.append(f"最近拉取：{self._fmt_ts(last_pull) if last_pull else '尚未拉取'} ｜ 累计接收 {int(status.get('pulled') or 0)} 条")
         lines.append(f"网站端待投递：{int(status.get('pending_deliveries') or 0)} 条")
+        all_questions = self._questions(include_disabled=True)
+        usable = [item for item in self._questions() if self._question_usable(item)]
+        lines.append(
+            f"题库同步：{len(all_questions)} 条（可用 {len(usable)} 条 ｜ 通用答案 {len(self._common_answers())} 条）"
+            "→ 网站没有自己的题库时就用这套出题"
+        )
         if status.get("last_error"):
             lines.append(f"⚠️ 最近错误：{status['last_error']}")
         lines.append("其它用法：/审核 网站 同步 ｜ 地址 ｜ token ｜ 密码 <新密码>")

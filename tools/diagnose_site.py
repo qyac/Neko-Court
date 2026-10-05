@@ -209,6 +209,42 @@ def main(argv: list[str] | None = None) -> int:
         if enabled:
             problems.append("开了开关但没有数据文件：看 AstrBot 日志里有没有「内置审核网站启动失败」（通常是端口被占用）")
 
+    # 3.5) 题库与网页答题
+    print("  ── 网页答题 ──")
+    ask_on = bool(settings.get("web_ask_questions", True))
+    print(("  ✅ 网页答题：开" if ask_on else "  ⚠️  网页答题：关（申请人只需填 QQ 与 B站 UID）"))
+    site_questions = 0
+    plugin_questions = 0
+    if data_db.is_file():
+        try:
+            import sqlite3
+
+            conn = sqlite3.connect(f"file:{data_db}?mode=ro", uri=True)
+            conn.row_factory = sqlite3.Row
+            site_questions = int(conn.execute("SELECT COUNT(*) AS n FROM questions WHERE enabled = 1").fetchone()["n"])
+            row = conn.execute("SELECT value FROM settings WHERE key = 'plugin_questions'").fetchone()
+            if row is not None:
+                try:
+                    plugin_questions = len([item for item in json.loads(row["value"]) if isinstance(item, dict) and item.get("enabled", True)])
+                except Exception:
+                    plugin_questions = 0
+            conn.close()
+        except Exception as exc:
+            print(WARN + f"题库读取失败：{exc}")
+    synced_at = float(settings.get("plugin_synced_at") or 0)
+    print(INFO + f"站点题库：{site_questions} 条（在网站后台「题库」里维护）")
+    if synced_at:
+        print(INFO + f"插件题库：{plugin_questions} 条（插件同步过来的，站点题库为空时用它）")
+    else:
+        print(WARN + "插件题库：尚未同步过（插件还没成功连上本站；先看上面的同步状态）")
+    effective = site_questions or plugin_questions
+    # 题库为空只是"不会出题"，不影响站点可用，所以算提示不算错误
+    if ask_on and effective == 0:
+        print(WARN + "题库是空的 → 网页不会出题（申请人只需填 QQ 与 B站 UID）")
+        print(INFO + "想让人在网页上答题：网站后台「题库」新增题目，或在插件配置里配好 questions 并重载插件")
+    elif ask_on:
+        print(OK + f"网页会随机出一道题（可用题目约 {effective} 条）")
+
     # 4) 端口
     print("  ── 端口检查 ──")
     reachable, note = port_state(host, port)

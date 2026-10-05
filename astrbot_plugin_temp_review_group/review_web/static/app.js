@@ -12,13 +12,23 @@ import {
   NOTE_MAX,
   buildApplyPayload,
   buildDecisionPayload,
+  chipsToText,
   formatTime,
+  hasQuestion,
   isTerminal,
+  matchModeLabel,
   nextOffset,
+  normalizeQuestion,
+  normalizeThreshold,
+  parseListInput,
   prevOffset,
+  questionSourceLabel,
+  questionStats,
   relativeTime,
+  sortQuestions,
   statusClass,
   statusLabel,
+  validateAnswerInput,
   validateForm,
 } from "./form.js";
 
@@ -27,6 +37,20 @@ const POLL_INTERVAL_MS = 2000;
 const POLL_TIMEOUT_MS = 60000;
 const SEARCH_DEBOUNCE_MS = 300;
 const DASH = "—";
+/** 题库接口的写操作 action（后端 ./api/admin/questions 契约）。 */
+const QUESTION_ACTIONS = Object.freeze({
+  upsert: "upsert",
+  remove: "delete",
+  toggle: "toggle",
+  clear: "clear",
+  setAsk: "set_ask",
+  setCommon: "set_common",
+  setMode: "set_mode",
+});
+/** 后端答错时的固定文案（reason 里不含参考答案）。 */
+const ANSWER_REJECTION_RE = /回答不正确|答案不正确|再试一次|重新作答/;
+/** 提交失败但其实是“题目变了/没作答”，此时重新取一题更合适。 */
+const QUESTION_RETRY_RE = /题目|作答|回答问题/;
 
 /* ------------------------------------------------------------------ *
  * DOM / 通用工具
@@ -217,6 +241,18 @@ function initApplyPage() {
   const progress = byId("apply-progress");
   const progressText = byId("apply-progress-text");
   const resultBox = byId("apply-result");
+  // 网页答题区域（apply.html 里的 question-block）
+  const questionBlock = byId("question-block");
+  const questionTextBox = byId("question-text");
+  const questionHint = byId("question-hint");
+  const questionAnswer = byId("question-answer");
+  const questionField = byId("question-text-hidden");
+  const questionActions = byId("question-actions");
+  const questionNotice = byId("question-notice");
+
+  /** 页面上是否真的显示了题目（决定提交时要不要带 question/answer）。 */
+  let questionReady = false;
+  let questionLoading = false;
 
   let timer = null;
   let polling = false;
@@ -244,6 +280,8 @@ function initApplyPage() {
       const field = byId(key);
       if (field) field.removeAttribute("aria-invalid");
     }
+    setText("question-answer-error", "");
+    if (questionAnswer) questionAnswer.removeAttribute("aria-invalid");
   }
 
   function showErrors(errors) {
@@ -260,6 +298,100 @@ function initApplyPage() {
       }
     }
     if (first && typeof first.focus === "function") first.focus();
+  }
+
+  /* ---------- 审核问题（GET ./api/questions） ---------- */
+
+  /** 不挡路的提示条：只说明情况，不阻止提交。 */
+  function setQuestionNotice(message) {
+    if (!questionNotice) return;
+    questionNotice.replaceChildren();
+    if (!message) {
+      questionNotice.hidden = true;
+      return;
+    }
+    questionNotice.hidden = false;
+    questionNotice.append(el("span", { class: "alert-text", text: message }));
+  }
+
+  function hideQuestionBlock() {
+    questionReady = false;
+    if (questionField) questionField.value = "";
+    if (questionAnswer) {
+      questionAnswer.value = "";
+      questionAnswer.removeAttribute("aria-invalid");
+    }
+    setText("question-answer-error", "");
+    if (questionActions) questionActions.replaceChildren();
+    if (questionBlock) questionBlock.hidden = true;
+  }
+
+  /** 把后端下发的题目渲染进表单（绝不显示答案）。 */
+  function renderQuestion(data) {
+    const info = normalizeQuestion(data);
+    if (!hasQuestion(info)) {
+      hideQuestionBlock();
+      return false;
+    }
+
+    questionReady = true;
+    if (questionBlock) questionBlock.hidden = false;
+    if (questionTextBox) questionTextBox.textContent = info.question;
+    if (questionField) questionField.value = info.question;
+    if (questionHint) {
+      questionHint.textContent = info.hint;
+      questionHint.hidden = !info.hint;
+    }
+    if (questionAnswer) {
+      questionAnswer.value = "";
+      questionAnswer.removeAttribute("aria-invalid");
+    }
+    setText("question-answer-error", "");
+
+    if (questionActions) {
+      questionActions.replaceChildren();
+      // total > 1 才给「换一题」，否则换无可换
+      if (info.total > 1) {
+        questionActions.append(
+          el("button", {
+            type: "button",
+            id: "question-refresh",
+            class: "btn btn-small",
+            text: "换一题",
+            "aria-label": "换一道审核问题",
+            onclick: () => {
+              loadQuestion(true);
+            },
+          }),
+        );
+      }
+    }
+    return true;
+  }
+
+  /** 取一道题；失败时只提示，不阻止用户直接提交。 */
+  async function loadQuestion(focusAnswer) {
+    if (questionLoading) return;
+    questionLoading = true;
+    const out = await requestJson("./api/questions");
+    questionLoading = false;
+
+    if (!out.ok) {
+      hideQuestionBlock();
+      setQuestionNotice("审核问题加载失败，可直接提交或刷新页面。");
+      return;
+    }
+    const body = out.body || {};
+    if (body.enabled !== true) {
+      hideQuestionBlock();
+      setQuestionNotice("");
+      return;
+    }
+    setQuestionNotice("");
+    const shown = renderQuestion(body);
+    if (shown && focusAnswer && questionAnswer && typeof questionAnswer.focus === "function") {
+      questionAnswer.focus();
+    }
   }
 
   function stopPolling() {
@@ -339,10 +471,26 @@ function initApplyPage() {
     });
   }
 
+  /** 是否是“审核问题答错”导致的拒绝（后端不会在 reason 里给答案）。 */
+  function isAnswerRejection(data) {
+    // 优先用后端给的机器可读字段（v1.1.9 起返回 answer_ok），没有再退回文案匹配
+    if (data && data.answer_ok === false) return true;
+    const reason = data && typeof data.reason === "string" ? data.reason : "";
+    return ANSWER_REJECTION_RE.test(reason);
+  }
+
   function renderRejected(data, status) {
     showResultCard(status, (card) => {
       card.append(el("p", { text: statusLabel(status) === "已拉黑" ? "该 QQ 已被拉黑，无法申请入群。" : "很抱歉，本次申请未通过。" }));
       card.append(el("p", { text: `原因：${text(data.reason, "未提供原因")}` }));
+      if (isAnswerRejection(data)) {
+        card.append(
+          el("p", {
+            class: "hint",
+            text: "点下面的「重新填写」会重新取一道题，清空答案后可以再答一次。",
+          }),
+        );
+      }
       card.append(el("p", { class: "hint", text: "如有疑问，请在群里联系管理员确认。" }));
     });
   }
@@ -372,7 +520,7 @@ function initApplyPage() {
     return renderPending();
   }
 
-  function addRestartButton() {
+  function addRestartButton(refreshQuestion) {
     const card = resultBox && resultBox.querySelector(".result-card");
     if (!card || card.querySelector("#apply-restart")) return;
     card.append(
@@ -392,11 +540,17 @@ function initApplyPage() {
             clearErrors();
             if (noteInput) noteInput.value = "";
             if (noteCount) noteCount.textContent = `0 / ${NOTE_MAX}`;
-            if (qqInput) {
-              qqInput.value = "";
-              if (typeof qqInput.focus === "function") qqInput.focus();
-            }
+            if (qqInput) qqInput.value = "";
             if (uidInput) uidInput.value = "";
+            if (questionAnswer) questionAnswer.value = "";
+            if (refreshQuestion) {
+              // 答错后换一题更有意义
+              loadQuestion(true).then(() => {
+                if (!questionReady && qqInput && typeof qqInput.focus === "function") qqInput.focus();
+              });
+              return;
+            }
+            if (qqInput && typeof qqInput.focus === "function") qqInput.focus();
           },
         }),
       ]),
@@ -431,7 +585,7 @@ function initApplyPage() {
       if (isTerminal(data.status)) {
         stopPolling();
         renderResult(data);
-        addRestartButton();
+        addRestartButton(isAnswerRejection(data));
       }
     }, POLL_INTERVAL_MS);
   }
@@ -440,11 +594,11 @@ function initApplyPage() {
     const payload = data || {};
     if (isTerminal(payload.status)) {
       renderResult(payload);
-      addRestartButton();
+      addRestartButton(isAnswerRejection(payload));
       return;
     }
     renderPending();
-    addRestartButton();
+    addRestartButton(false);
     startPolling(payload.ticket);
   }
 
@@ -467,6 +621,8 @@ function initApplyPage() {
       qq: qqInput ? qqInput.value : "",
       uid: uidInput ? uidInput.value : "",
       note: noteInput ? noteInput.value : "",
+      question: questionReady && questionField ? questionField.value : "",
+      answer: questionAnswer ? questionAnswer.value : "",
     };
 
     const check = validateForm(values);
@@ -476,6 +632,19 @@ function initApplyPage() {
       return;
     }
     clearErrors();
+
+    // 需要答题时答案不能为空：就地报错，不发起提交
+    const answerError = validateAnswerInput(questionReady, values.answer);
+    if (answerError) {
+      setText("question-answer-error", answerError);
+      if (questionAnswer) {
+        questionAnswer.setAttribute("aria-invalid", "true");
+        if (typeof questionAnswer.focus === "function") questionAnswer.focus();
+      }
+      setProgress("");
+      return;
+    }
+
     setSubmitting(true);
     setProgress("正在向 B站核验，请稍候…");
 
@@ -484,11 +653,19 @@ function initApplyPage() {
 
     if (!out.ok) {
       setProgress("");
-      showAlert(out.error || "申请提交失败，请稍后重试。");
+      const message = out.error || "申请提交失败，请稍后重试。";
+      showAlert(message);
+      // 题目被管理员改掉 / 没带题目：顺手重新取一题，用户可直接再答
+      if (QUESTION_RETRY_RE.test(message)) {
+        await loadQuestion(false);
+        setQuestionNotice(`${message}（已重新取题，请在审核问题区域重新作答）`);
+      }
       return;
     }
     handleApplyResponse(out.body);
   });
+
+  loadQuestion(false);
 }
 
 /* ------------------------------------------------------------------ *
@@ -1067,6 +1244,581 @@ function initAdminPage() {
 }
 
 /* ------------------------------------------------------------------ *
+ * 管理后台 · 题库（网页答题）
+ * ------------------------------------------------------------------ */
+
+function initQuestionBankPanel() {
+  const panel = byId("questions-panel");
+  if (!panel) return;
+
+  const statusLine = byId("questions-status");
+  const askToggle = byId("ask-questions");
+  const modeSelect = byId("site-match-mode");
+  const thresholdInput = byId("site-fuzzy-threshold");
+  const commonHost = byId("site-common-editor");
+  const siteHost = byId("site-questions");
+  const pluginHost = byId("plugin-questions");
+  const refreshBtn = byId("questions-refresh");
+  const addBtn = byId("question-add");
+  const clearBtn = byId("questions-clear");
+  const syncedLine = byId("plugin-synced-at");
+
+  const csrfMeta = document.querySelector('meta[name="csrf"]');
+  const bank = {
+    csrf: csrfMeta ? csrfMeta.getAttribute("content") || "" : "",
+    ask: true,
+    source: "",
+    activeCount: 0,
+    siteCount: 0,
+    pluginCount: 0,
+    mode: "contains",
+    threshold: 0.8,
+    modeOptions: [],
+    commonAnswers: [],
+    syncedAt: 0,
+    drafts: [],
+    plugin: [],
+    // 服务端最后一次确认的值（写操作失败时回滚控件用）
+    serverAsk: true,
+    serverMode: "contains",
+    serverThreshold: 0.8,
+    serverCommon: [],
+  };
+
+  const initial = readInitialData() || {};
+  if (initial.csrf) bank.csrf = String(initial.csrf);
+
+  let seq = 0;
+
+  /* ---------- 小工具 ---------- */
+
+  function nextUid() {
+    seq += 1;
+    return `q${seq}`;
+  }
+
+  /** 后端站点题目 / 新增草稿 → 编辑模型（answers 支持数组或字符串）。 */
+  function toDraft(raw) {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const id = Number(item.id);
+    const hasId = Number.isFinite(id) && id > 0;
+    return {
+      uid: nextUid(),
+      id: hasId ? id : 0,
+      isNew: !hasId,
+      source: "site",
+      enabled: item.enabled !== false,
+      question: text(item.question, ""),
+      hint: text(item.hint, ""),
+      answers: parseListInput(item.answers),
+      match_mode: text(item.match_mode, "inherit"),
+    };
+  }
+
+  function currentOptions() {
+    const options = bank.modeOptions.length
+      ? bank.modeOptions.slice()
+      : ["inherit", "contains", "exact", "regex", "fuzzy"];
+    return options;
+  }
+
+  function modeOptionsInto(select, current) {
+    const options = currentOptions();
+    if (options.indexOf(current) === -1 && current) options.push(current);
+    select.replaceChildren();
+    for (const mode of options) {
+      const option = el("option", { value: mode, text: `${matchModeLabel(mode)}（${mode}）` });
+      if (mode === current) option.selected = true;
+      select.append(option);
+    }
+    return select;
+  }
+
+  function metaText(draft) {
+    return `${draft.enabled ? "已启用" : "已停用"}｜${matchModeLabel(draft.match_mode)}｜${draft.answers.length} 个答案`;
+  }
+
+  /** 独立在 .field 之外的说明文字：补上 style.css 里 .field .hint 的次要样式。 */
+  function hintLine(message) {
+    return el("p", {
+      class: "hint",
+      style: "color:var(--text-muted);font-size:0.86rem;margin:6px 0",
+      text: message,
+    });
+  }
+
+  function labeled(labelText, control) {
+    return el("div", { class: "field" }, [
+      el("span", { class: "section-title", text: labelText }),
+      control,
+    ]);
+  }
+
+  /**
+   * 答案 chips 编辑器：直接读写传入的数组，变更后回调 onChange。
+   * 只用 style.css 里已有的类名 + 内联样式拼装。
+   */
+  function chipsEditor(values, options) {
+    const opts = options || {};
+    const host = el("div", { class: "row", role: "list", "aria-label": opts.label || "答案" });
+    const input = el("input", {
+      type: "text",
+      autocomplete: "off",
+      placeholder: opts.placeholder || "输入后按回车或点「添加」",
+      "aria-label": `${opts.label || "答案"}：新增一项`,
+    });
+    const addButton = el("button", { type: "button", class: "btn btn-small", text: "添加" });
+    const errorText = el("p", { class: "field-error", role: "alert" });
+
+    const renderChips = () => {
+      host.replaceChildren();
+      if (!values.length) {
+        host.append(el("span", { class: "hint", text: opts.emptyText || "还没有内容" }));
+        return;
+      }
+      values.forEach((value, index) => {
+        const chip = el("span", {
+          class: "badge badge-unknown",
+          role: "listitem",
+          style: "display:inline-flex;align-items:center;gap:6px;padding:3px 6px 3px 9px;margin:0 6px 6px 0",
+        });
+        chip.append(el("span", { text: String(value) }));
+        chip.append(
+          el("button", {
+            type: "button",
+            class: "btn btn-small btn-danger",
+            style: "min-height:24px;padding:2px 8px;font-size:0.78rem",
+            "aria-label": `删除：${String(value)}`,
+            text: "✕",
+            onclick: () => {
+              values.splice(index, 1);
+              renderChips();
+              if (typeof opts.onChange === "function") opts.onChange(values.slice());
+            },
+          }),
+        );
+        host.append(chip);
+      });
+    };
+
+    const add = () => {
+      const incoming = parseListInput(input.value);
+      if (!incoming.length) {
+        errorText.textContent = "请输入内容";
+        return;
+      }
+      let added = 0;
+      for (const item of incoming) {
+        if (values.indexOf(item) === -1) {
+          values.push(item);
+          added += 1;
+        }
+      }
+      input.value = "";
+      errorText.textContent = added ? "" : "这项已经存在";
+      renderChips();
+      if (added && typeof opts.onChange === "function") opts.onChange(values.slice());
+    };
+
+    addButton.addEventListener("click", add);
+    input.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        add();
+      }
+    });
+
+    renderChips();
+    return el("div", { class: "stack" }, [
+      host,
+      el("div", { class: "row" }, [input, addButton]),
+      errorText,
+    ]);
+  }
+
+  /* ---------- 渲染 ---------- */
+
+  function renderStatus() {
+    if (statusLine) {
+      const sourceLabel = questionSourceLabel(bank.source) || "无可用题目";
+      statusLine.textContent =
+        `当前出题来源：${sourceLabel}（站点题库 ${bank.siteCount} 条 / 插件题库 ${bank.pluginCount} 条，` +
+        `可用题目 ${bank.activeCount} 道）；网页答题${bank.ask ? "已开启" : "已关闭"}。`;
+    }
+    if (syncedLine) {
+      syncedLine.textContent = bank.syncedAt
+        ? `插件题库同步时间：${formatTime(bank.syncedAt)}（${relativeTime(bank.syncedAt)}）`
+        : "插件题库同步时间：尚未同步";
+    }
+  }
+
+  function renderCommonEditor() {
+    if (!commonHost) return;
+    commonHost.replaceChildren(
+      chipsEditor(bank.commonAnswers, {
+        label: "站点通用答案库",
+        placeholder: "输入通用答案后按回车",
+        emptyText: "还没有通用答案",
+        onChange: () => {
+          submitBank({
+            action: QUESTION_ACTIONS.setCommon,
+            common_answers: bank.commonAnswers.slice(),
+          });
+        },
+      }),
+    );
+  }
+
+  function renderGlobalControls() {
+    if (askToggle) askToggle.checked = bank.ask === true;
+    if (modeSelect) modeOptionsInto(modeSelect, bank.mode);
+    if (thresholdInput) thresholdInput.value = String(normalizeThreshold(bank.threshold));
+    renderCommonEditor();
+  }
+
+  function buildPluginCard(raw) {
+    const item = raw && typeof raw === "object" ? raw : {};
+    const answers = parseListInput(item.answers);
+    const details = el("details", {
+      style: "border:1px dashed var(--border);border-radius:8px;padding:10px;margin:0 0 12px",
+    });
+    const summary = el("summary", { style: "cursor:pointer" }, [
+      el("span", { style: "font-weight:600", text: text(item.question, "（未填写题干）") }),
+      el("span", {
+        class: "muted small",
+        style: "margin-left:8px",
+        text: `插件题库｜${matchModeLabel(item.match_mode)}｜${answers.length} 个答案｜${item.enabled === false ? "已停用" : "已启用"}`,
+      }),
+    ]);
+    const body = el("div", { class: "stack", style: "margin-top:10px" }, [
+      el("dl", { class: "kv" }, [
+        el("dt", { text: "答案" }),
+        el("dd", { text: answers.length ? answers.join("、") : DASH }),
+        el("dt", { text: "提示" }),
+        el("dd", { text: text(item.hint) }),
+      ]),
+      el("p", { class: "hint", text: "来自 QQ 插件（改它请到 AstrBot 插件配置）。" }),
+      hintLine("只读展示：插件题目在这里不提供编辑或删除按钮。"),
+    ]);
+    details.append(summary, body);
+    return details;
+  }
+
+  function buildSiteCard(draft) {
+    const details = el("details", {
+      id: `site-item-${draft.uid}`,
+      style: "border:1px solid var(--border);border-radius:8px;padding:10px;margin:0 0 12px",
+    });
+    details.open = draft.open === true;
+    details.addEventListener("toggle", () => {
+      draft.open = details.open;
+    });
+
+    const summaryTitle = el("span", {
+      style: "font-weight:600",
+      text: draft.question || "（未填写题干）",
+    });
+    const summaryMeta = el("span", { class: "muted small", style: "margin-left:8px" });
+    summaryMeta.textContent = metaText(draft);
+    const summary = el("summary", { style: "cursor:pointer" }, [summaryTitle, summaryMeta]);
+
+    const questionArea = el("textarea", {
+      id: `site-question-${draft.uid}`,
+      rows: "2",
+      maxlength: "300",
+      "aria-label": "题干",
+    });
+    questionArea.value = draft.question;
+    questionArea.addEventListener("input", () => {
+      draft.question = questionArea.value;
+      summaryTitle.textContent = draft.question || "（未填写题干）";
+    });
+
+    const hintInput = el("input", {
+      id: `site-hint-${draft.uid}`,
+      type: "text",
+      maxlength: "200",
+      autocomplete: "off",
+      "aria-label": "提示",
+    });
+    hintInput.value = draft.hint;
+    hintInput.addEventListener("input", () => {
+      draft.hint = hintInput.value;
+    });
+
+    const enabledBox = el("input", { id: `site-enabled-${draft.uid}`, type: "checkbox" });
+    enabledBox.checked = draft.enabled !== false;
+    enabledBox.addEventListener("change", () => {
+      draft.enabled = enabledBox.checked === true;
+      summaryMeta.textContent = metaText(draft);
+    });
+
+    const answersEditor = chipsEditor(draft.answers, {
+      label: "答案",
+      placeholder: "输入答案后按回车",
+      emptyText: "至少填一个答案",
+      onChange: () => {
+        summaryMeta.textContent = metaText(draft);
+      },
+    });
+
+    const modeField = modeOptionsInto(el("select", { "aria-label": "匹配方式" }), draft.match_mode);
+    modeField.addEventListener("change", () => {
+      draft.match_mode = modeField.value;
+      summaryMeta.textContent = metaText(draft);
+    });
+
+    const body = el("div", { class: "stack", style: "margin-top:10px" }, [
+      labeled("题干（必填，最多 300 字）", questionArea),
+      labeled("提示（可选）", hintInput),
+      labeled("答案（参考答案，可多个）", answersEditor),
+      labeled("匹配方式", modeField),
+      el("div", { class: "checkbox" }, [
+        enabledBox,
+        el("label", { for: `site-enabled-${draft.uid}`, text: "启用这道题" }),
+      ]),
+    ]);
+
+    const saveBtn = el("button", {
+      type: "button",
+      class: "btn btn-primary btn-small",
+      text: draft.isNew ? "新增" : "保存",
+    });
+    saveBtn.addEventListener("click", () => {
+      const payload = {
+        action: QUESTION_ACTIONS.upsert,
+        question: draft.question,
+        hint: draft.hint,
+        answers: draft.answers.slice(),
+        match_mode: draft.match_mode,
+        enabled: draft.enabled !== false,
+      };
+      if (draft.id) payload.id = draft.id;
+      submitBank(payload, saveBtn);
+    });
+
+    const deleteBtn = el("button", {
+      type: "button",
+      class: "btn btn-danger btn-small",
+      text: "删除",
+    });
+    deleteBtn.addEventListener("click", () => {
+      if (!draft.id) {
+        bank.drafts = bank.drafts.filter((item) => item !== draft);
+        renderLists();
+        return;
+      }
+      const label = draft.question ? `「${draft.question}」` : `#${draft.id}`;
+      if (!window.confirm(`确定删除这道题吗？${label}`)) return;
+      submitBank({ action: QUESTION_ACTIONS.remove, id: draft.id }, deleteBtn);
+    });
+
+    body.append(el("div", { class: "btn-row" }, [saveBtn, deleteBtn]));
+    details.append(summary, body);
+    return details;
+  }
+
+  function renderLists() {
+    if (siteHost) siteHost.replaceChildren();
+    if (pluginHost) pluginHost.replaceChildren();
+
+    // sortQuestions：站点题在前、插件题在后，各自保持后端给的顺序
+    for (const item of sortQuestions(bank.drafts.concat(bank.plugin))) {
+      const isPlugin =
+        item && typeof item === "object" && String(item.source || "").toLowerCase() === "plugin";
+      if (isPlugin) {
+        if (pluginHost) pluginHost.append(buildPluginCard(item));
+      } else if (siteHost) {
+        siteHost.append(buildSiteCard(item));
+      }
+    }
+
+    if (siteHost && !bank.drafts.length) {
+      siteHost.append(
+        hintLine("站点题库为空时，网页会用插件同步过来的题目（也可以点「新增题目」自己加）。"),
+      );
+    }
+    if (pluginHost && !bank.plugin.length) {
+      pluginHost.append(hintLine("插件题库暂时没有题目，插件同步后会显示在这里。"));
+    }
+  }
+
+  function renderAll() {
+    renderStatus();
+    renderGlobalControls();
+    renderLists();
+  }
+
+  /** 用 ./api/admin/questions 的返回值刷新整个分区。 */
+  function applyBank(data) {
+    const source = data && typeof data === "object" ? data : {};
+    if (source.csrf) bank.csrf = String(source.csrf);
+    const stats = questionStats(source);
+    bank.ask = stats.askEnabled;
+    bank.source = stats.source;
+    bank.activeCount = stats.activeCount;
+    bank.siteCount = stats.siteCount;
+    bank.pluginCount = stats.pluginCount;
+    bank.mode = text(source.site_match_mode, "contains");
+    bank.threshold = normalizeThreshold(source.site_fuzzy_threshold);
+    // 「站点默认匹配方式」不能用 inherit（那等于"跟随全局"而它本身就是全局），
+    // 所以优先用后端单独下发的 default_mode_options；没有就从总选项里剔除 inherit。
+    const rawOptions = Array.isArray(source.default_mode_options) && source.default_mode_options.length
+      ? source.default_mode_options
+      : Array.isArray(source.match_mode_options)
+        ? source.match_mode_options
+        : [];
+    bank.modeOptions = rawOptions
+      .map((item) => String(item))
+      .filter((item) => item && item !== "inherit");
+    bank.commonAnswers = parseListInput(source.site_common_answers);
+    // 记住服务端最后一次确认的值，写操作失败时用它把控件恢复原样
+    bank.serverCommon = bank.commonAnswers.slice();
+    bank.serverMode = bank.mode;
+    bank.serverThreshold = bank.threshold;
+    bank.serverAsk = bank.ask;
+    bank.syncedAt = Number(source.plugin_synced_at) || 0;
+    // 局部刷新时尽量保留已保存题目的展开状态（重渲染会重建 DOM）
+    const previous = new Map();
+    for (const item of bank.drafts) {
+      if (item.id) previous.set(String(item.id), item);
+    }
+    bank.drafts = (Array.isArray(source.site) ? source.site : []).map((raw) => {
+      const draft = toDraft(raw);
+      const old = draft.id ? previous.get(String(draft.id)) : null;
+      if (old) {
+        draft.uid = old.uid;
+        draft.open = old.open === true;
+      }
+      return draft;
+    });
+    bank.plugin = Array.isArray(source.plugin) ? source.plugin : [];
+    renderAll();
+  }
+
+  async function submitBank(payload, button) {
+    if (button) {
+      button.disabled = true;
+      button.setAttribute("aria-busy", "true");
+    }
+    const out = await postJson(
+      "./api/admin/questions",
+      Object.assign({ csrf: bank.csrf }, payload),
+    );
+    if (button) {
+      button.disabled = false;
+      button.setAttribute("aria-busy", "false");
+    }
+
+    if (out.status === 403) {
+      showAlert(out.error || "CSRF 校验失败，请刷新页面后重试。");
+      restoreControls(payload);
+      return;
+    }
+    if (!out.ok) {
+      if (out.status !== 401) showAlert(out.error || "题库保存失败，请稍后重试。");
+      restoreControls(payload);
+      return;
+    }
+    showAlert("");
+    applyBank(out.body || {});
+    toast("题库已更新");
+  }
+
+  /**
+   * 写操作失败时把「出题设置」里的控件恢复成服务端最后一次确认的值。
+   * 典型场景：站点默认匹配方式不允许选「跟随全局」，后端会返回 400。
+   */
+  function restoreControls(payload) {
+    const action = payload && payload.action;
+    if (action === QUESTION_ACTIONS.setAsk) {
+      bank.ask = bank.serverAsk === undefined ? bank.ask : bank.serverAsk;
+    } else if (action === QUESTION_ACTIONS.setMode) {
+      bank.mode = bank.serverMode === undefined ? bank.mode : bank.serverMode;
+      bank.threshold = bank.serverThreshold === undefined ? bank.threshold : bank.serverThreshold;
+    } else if (action === QUESTION_ACTIONS.setCommon) {
+      bank.commonAnswers = (bank.serverCommon || []).slice();
+    } else {
+      return; // 题目卡片里的修改保留在草稿里，方便用户改完再存
+    }
+    renderGlobalControls();
+  }
+
+  async function loadBank() {
+    if (statusLine) statusLine.textContent = "正在加载题库…";
+    const out = await requestJson("./api/admin/questions");
+    if (!out.ok) {
+      if (out.status !== 401) {
+        const message = out.error || "题库加载失败，请稍后重试。";
+        if (statusLine) statusLine.textContent = message;
+        showAlert(message);
+      }
+      return;
+    }
+    applyBank(out.body || {});
+  }
+
+  /* ---------- 事件绑定 ---------- */
+
+  if (askToggle) {
+    askToggle.addEventListener("change", () => {
+      submitBank({ action: QUESTION_ACTIONS.setAsk, enabled: askToggle.checked === true });
+    });
+  }
+
+  if (modeSelect) {
+    modeSelect.addEventListener("change", () => {
+      submitBank({
+        action: QUESTION_ACTIONS.setMode,
+        match_mode: modeSelect.value,
+        fuzzy_threshold: normalizeThreshold(thresholdInput ? thresholdInput.value : bank.threshold),
+      });
+    });
+  }
+
+  if (thresholdInput) {
+    thresholdInput.addEventListener("change", () => {
+      submitBank({
+        action: QUESTION_ACTIONS.setMode,
+        match_mode: modeSelect ? modeSelect.value : bank.mode,
+        fuzzy_threshold: normalizeThreshold(thresholdInput.value),
+      });
+    });
+  }
+
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => {
+      loadBank();
+      toast("正在刷新题库");
+    });
+  }
+
+  if (addBtn) {
+    addBtn.addEventListener("click", () => {
+      const draft = toDraft({ enabled: true, match_mode: "inherit" });
+      draft.isNew = true;
+      bank.drafts.push(draft);
+      renderLists();
+      const details = siteHost ? siteHost.querySelector(`#site-item-${draft.uid}`) : null;
+      if (details) {
+        details.open = true;
+        const area = byId(`site-question-${draft.uid}`);
+        if (area && typeof area.focus === "function") area.focus();
+      }
+    });
+  }
+
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      if (!window.confirm("确定清空站点题库吗？会删除全部站点题目（插件同步过来的题目不受影响）。")) return;
+      submitBank({ action: QUESTION_ACTIONS.clear }, clearBtn);
+    });
+  }
+
+  loadBank();
+}
+
+/* ------------------------------------------------------------------ *
  * 启动
  * ------------------------------------------------------------------ */
 
@@ -1085,6 +1837,11 @@ function boot() {
     initAdminPage();
   } catch (err) {
     showAlert("管理后台初始化失败，请刷新页面重试。");
+  }
+  try {
+    initQuestionBankPanel();
+  } catch (err) {
+    showAlert("题库面板初始化失败，请刷新页面重试。");
   }
 }
 

@@ -146,16 +146,28 @@ export function validateForm({ qq, uid, note } = {}) {
   return { ok: Object.keys(errors).length === 0, errors };
 }
 
-/** 规范化后的申请请求体：去空格，UID 只留数字，note 缺省为空串。 */
-export function buildApplyPayload({ qq, uid, note } = {}) {
+/**
+ * 规范化后的申请请求体：去空格，UID 只留数字，note 缺省为空串。
+ *
+ * 网页答题：只有在页面上真的拿到并显示了题目（question 非空）时才带上
+ * `question` / `answer` 两个键；不需要答题时请求体保持原样（后端会按需忽略）。
+ */
+export function buildApplyPayload({ qq, uid, note, question, answer } = {}) {
   const qqText = isBlank(qq) ? "" : String(qq).trim();
   const uidText = isBlank(uid) ? "" : String(uid).trim();
   const extracted = extractUid(uidText);
-  return {
+  const payload = {
     qq: qqText,
     uid: extracted === null ? digitsOnly(uidText) : extracted,
     note: isBlank(note) ? "" : String(note).trim(),
   };
+
+  const asked = isBlank(question) ? "" : String(question).trim();
+  if (asked) {
+    payload.question = asked;
+    payload.answer = isBlank(answer) ? "" : String(answer).trim();
+  }
+  return payload;
 }
 
 /** 管理后台决策/删除请求体。 */
@@ -300,4 +312,185 @@ export function csvCell(value) {
   const text = typeof value === "string" ? value : String(value);
   if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
   return text;
+}
+
+/* ------------------------------------------------------------------ *
+ * 网页答题：申请页的题目模型
+ * ------------------------------------------------------------------ */
+
+/** 答案最长长度（与后端 answer[:200] 对齐，输入框用它做 maxlength）。 */
+export const ANSWER_MAX = 200;
+/** 题干最长长度（与后端 300 字上限对齐）。 */
+export const QUESTION_MAX = 300;
+/** 题库默认匹配方式（站点未配置时的兜底）。 */
+export const DEFAULT_MATCH_MODE = "contains";
+/** 模糊阈值默认值与区间（与后端 matching.clamp_threshold 一致）。 */
+export const DEFAULT_FUZZY_THRESHOLD = 0.8;
+export const MIN_FUZZY_THRESHOLD = 0.5;
+export const MAX_FUZZY_THRESHOLD = 1;
+
+/** 匹配方式 → 中文标签。 */
+export const MATCH_MODE_LABELS = Object.freeze({
+  inherit: "跟随全局",
+  contains: "包含关键词",
+  exact: "完全相等",
+  regex: "正则",
+  fuzzy: "模糊相似",
+});
+
+/** 出题来源 → 中文标签。 */
+export const QUESTION_SOURCE_LABELS = Object.freeze({
+  site: "站点题库",
+  plugin: "插件题库",
+});
+
+/** 匹配方式下拉的兜底选项（后端会下发 match_mode_options）。 */
+export const MATCH_MODE_OPTIONS = Object.freeze([
+  "inherit",
+  "contains",
+  "exact",
+  "regex",
+  "fuzzy",
+]);
+
+/** 宽松布尔：字符串 "true"/"1"/"yes" 也算真；无法判断时用 fallback。 */
+function boolValue(value, fallback = false) {
+  if (typeof value === "boolean") return value;
+  if (typeof value === "number") return value !== 0;
+  if (typeof value === "string") {
+    const key = value.trim().toLowerCase();
+    if (key === "true" || key === "1" || key === "yes" || key === "on") return true;
+    if (key === "false" || key === "0" || key === "no" || key === "off" || key === "") return false;
+  }
+  return fallback;
+}
+
+/** 非负整数计数：脏数据/负数 → fallback。 */
+function countValue(value, fallback = 0) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) return fallback;
+  return Math.floor(n);
+}
+
+/** 文本字段：null/undefined → 空串，其余 trim。 */
+function textValue(value) {
+  return isBlank(value) ? "" : String(value).trim();
+}
+
+/**
+ * 申请页题目模型：任何脏数据都能得到结构完整的对象。
+ * @returns {{enabled: boolean, question: string, hint: string, total: number, source: string}}
+ */
+export function normalizeQuestion(data) {
+  const source = data && typeof data === "object" ? data : {};
+  const rawSource = textValue(source.source).toLowerCase();
+  return {
+    // 后端明确返回 enabled:true 才算需要答题（缺失/脏数据一律按“不答题”处理）
+    enabled: boolValue(source.enabled, false),
+    question: textValue(source.question),
+    hint: textValue(source.hint),
+    total: countValue(source.total, 0),
+    source: rawSource === "plugin" ? "plugin" : "site",
+  };
+}
+
+/** 是否真的可以答题：enabled 为真且题干非空。 */
+export function hasQuestion(data) {
+  const info = normalizeQuestion(data);
+  return info.enabled === true && info.question !== "";
+}
+
+/** 需要答题时答案不能为空；返回 null 表示通过，否则返回就地错误文案。 */
+export function validateAnswerInput(questionEnabled, answer) {
+  if (questionEnabled !== true) return null;
+  const text = textValue(answer);
+  if (!text) return "请先回答审核问题再提交";
+  return null;
+}
+
+/**
+ * 题目渲染顺序：站点题在前、插件题在后，各自保持原有顺序（稳定排序）。
+ * @param {Array<{source?: string}>} items
+ */
+export function sortQuestions(items) {
+  const list = Array.isArray(items) ? items : [];
+  const site = [];
+  const plugin = [];
+  for (const item of list) {
+    const source = item && typeof item === "object" ? textValue(item.source).toLowerCase() : "";
+    if (source === "plugin") plugin.push(item);
+    else site.push(item);
+  }
+  return site.concat(plugin);
+}
+
+/**
+ * 管理后台顶部状态行的数据（脏数据兜底）。
+ * @returns {{siteCount: number, pluginCount: number, activeCount: number, source: string, askEnabled: boolean}}
+ */
+export function questionStats(payload) {
+  const data = payload && typeof payload === "object" ? payload : {};
+  const site = Array.isArray(data.site) ? data.site : [];
+  const plugin = Array.isArray(data.plugin) ? data.plugin : [];
+  const rawSource = textValue(data.active_source).toLowerCase();
+  return {
+    siteCount: site.length,
+    pluginCount: plugin.length,
+    activeCount: countValue(data.active_count, 0),
+    source: rawSource === "plugin" ? "plugin" : rawSource === "site" ? "site" : "",
+    // 与后端默认值一致：字段缺失时按“开启答题”处理
+    askEnabled: boolValue(data.ask_questions, true),
+  };
+}
+
+/** 匹配方式 → 中文标签；未知模式原样返回（空值返回空串）。 */
+export function matchModeLabel(mode) {
+  const raw = textValue(mode);
+  const key = raw.toLowerCase();
+  return Object.prototype.hasOwnProperty.call(MATCH_MODE_LABELS, key)
+    ? MATCH_MODE_LABELS[key]
+    : raw;
+}
+
+/** 出题来源 → 中文标签；未知来源原样返回。 */
+export function questionSourceLabel(source) {
+  const key = textValue(source).toLowerCase();
+  return Object.prototype.hasOwnProperty.call(QUESTION_SOURCE_LABELS, key)
+    ? QUESTION_SOURCE_LABELS[key]
+    : key;
+}
+
+/**
+ * 列表输入解析：换行、逗号（中英文）、分号（中英文）、顿号分隔；
+ * 去空、去重、保持顺序。数组输入同样会去空去重。
+ */
+export function parseListInput(text) {
+  if (text === undefined || text === null) return [];
+  const raw = Array.isArray(text) ? text : String(text).split(/[\n\r,，;；、]+/);
+  const out = [];
+  const seen = new Set();
+  for (const item of raw) {
+    const value = textValue(item);
+    if (!value || seen.has(value)) continue;
+    seen.add(value);
+    out.push(value);
+  }
+  return out;
+}
+
+/** 答案列表 → chips 编辑框回填文本（逗号分隔）。 */
+export function chipsToText(list) {
+  return parseListInput(list).join(", ");
+}
+
+/** 模糊阈值规范到 0.5~1.0；空值/脏数据用默认值 0.8。 */
+export function normalizeThreshold(value, fallback = DEFAULT_FUZZY_THRESHOLD) {
+  const raw = isBlank(value) ? NaN : Number(value);
+  const fallbackNumber = Number(fallback);
+  const base = Number.isFinite(raw)
+    ? raw
+    : Number.isFinite(fallbackNumber)
+      ? fallbackNumber
+      : DEFAULT_FUZZY_THRESHOLD;
+  return Math.min(MAX_FUZZY_THRESHOLD, Math.max(MIN_FUZZY_THRESHOLD, base));
 }

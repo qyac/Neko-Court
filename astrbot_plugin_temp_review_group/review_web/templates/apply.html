@@ -59,6 +59,25 @@
       <p class="hint" id="note-count">0 / 200</p>
     </div>
 
+    <div id="question-notice" class="alert alert-warn" role="status" hidden></div>
+
+    <fieldset id="question-block" aria-labelledby="question-legend" aria-describedby="question-text" hidden>
+      <legend id="question-legend">审核问题</legend>
+      <p id="question-text" style="font-weight:700;font-size:1.06rem;margin:0 0 8px"></p>
+      <div class="field">
+        <p class="hint" id="question-hint" hidden></p>
+        <label for="question-answer">你的回答 <span class="req" aria-hidden="true">*</span></label>
+        <input id="question-answer" name="question-answer" type="text" autocomplete="off"
+               enterkeyhint="done" maxlength="200"
+               placeholder="填写上面这道题的答案"
+               aria-describedby="question-hint question-answer-error">
+        <p class="field-error" id="question-answer-error" role="alert"></p>
+        <p class="hint">答错可以点下面的「重新填写」再取一道题；题目要求也会由管理员随时更新。</p>
+      </div>
+      <div class="btn-row" id="question-actions"></div>
+      <input type="hidden" id="question-text-hidden" value="">
+    </fieldset>
+
     <button type="submit" id="apply-submit" class="btn btn-primary btn-block">提交申请</button>
   </form>
 

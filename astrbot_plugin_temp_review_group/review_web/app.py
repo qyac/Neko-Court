@@ -21,6 +21,7 @@ import hmac
 import io
 import json
 import os
+import random
 import re
 import secrets
 import sqlite3
@@ -32,7 +33,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
-from . import bili, render
+from . import bili, matching, render
 from .store import STATUSES, Store
 
 def _site_version() -> str:
@@ -167,6 +168,38 @@ class App:
 
     def plugin_token(self) -> str:
         return str(self.store.get_setting("plugin_token") or "")
+
+    def question_bank(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        """网页出题用的题库：**站点自己的题库优先**，没配就用插件同步过来的。"""
+        data = settings or self.settings()
+        site_common = [str(item).strip() for item in (data.get("site_common_answers") or []) if str(item).strip()]
+        plugin_common = [str(item).strip() for item in (data.get("plugin_common_answers") or []) if str(item).strip()]
+        common = list(dict.fromkeys([*site_common, *plugin_common]))
+        site_items = self.store.list_questions(only_enabled=True)
+        if site_items:
+            return {
+                "source": "site",
+                "items": site_items,
+                "common": common,
+                "match_mode": str(data.get("site_match_mode") or matching.DEFAULT_MATCH_MODE),
+                "threshold": matching.clamp_threshold(data.get("site_fuzzy_threshold")),
+            }
+        plugin_items = [
+            dict(item, source="plugin")
+            for item in (data.get("plugin_questions") or [])
+            if isinstance(item, dict) and item.get("enabled", True) and str(item.get("question") or "").strip()
+        ]
+        return {
+            "source": "plugin" if plugin_items else "none",
+            "items": plugin_items,
+            "common": common,
+            "match_mode": str(data.get("plugin_match_mode") or matching.DEFAULT_MATCH_MODE),
+            "threshold": matching.clamp_threshold(data.get("plugin_fuzzy_threshold")),
+        }
+
+    def usable_questions(self, bank: dict[str, Any]) -> list[dict[str, Any]]:
+        """题库里真正能用来出题的条目（有题干，且该题有答案或配了通用答案库）。"""
+        return [item for item in bank["items"] if matching.question_usable(item, bank["common"])]
 
     def effective_rules(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
         """判定规则：默认用站点自己的；开了 use_plugin_rules 且插件同步过规则则用插件的。"""
@@ -402,12 +435,16 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, {"ok": True, "version": SITE_VERSION, "time": time.time()})
             if path.startswith("/static/"):
                 return self._static(path[len("/static/"):])
+            if path == "/api/questions":
+                return self._api_questions()
             if path.startswith("/api/apply/"):
                 return self._api_apply_status(path.rsplit("/", 1)[-1])
             if path == "/api/admin/applications":
                 return self._api_admin_applications(query)
             if path == "/api/admin/settings":
                 return self._api_admin_get_settings()
+            if path == "/api/admin/questions":
+                return self._api_admin_questions()
             if path == "/api/admin/export.csv":
                 return self._api_admin_export()
             if path == "/api/admin/logout":
@@ -441,6 +478,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_admin_login()
             if path == "/api/admin/decision":
                 return self._api_admin_decision()
+            if path == "/api/admin/questions":
+                return self._api_admin_save_questions()
             if path == "/api/admin/settings":
                 return self._api_admin_save_settings()
             if path == "/api/admin/delete":
@@ -528,6 +567,9 @@ class Handler(BaseHTTPRequestHandler):
     def _apply_result(self, row: dict[str, Any]) -> dict[str, Any]:
         settings = self.settings()
         item = self.store.public_item(row)
+        item["answered"] = bool(str(row.get("answer") or ""))
+        # 给前端一个机器可读的判定结果（申请人自己的信息，不泄露答案）
+        item["answer_ok"] = None if row.get("answer_ok") is None else bool(row.get("answer_ok"))
         item.update(
             {
                 "ok": True,
@@ -554,6 +596,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._apply_refused("提交太频繁了，请过几分钟再试。", wants_json, status=429)
             if not self.app.apply_limiter.hit(f"qq:{qq}", limit=per_qq):
                 return self._apply_refused("这个 QQ 短时间内提交太多次了，请稍后再试。", wants_json, status=429)
+
+            # 先判题（本地、便宜），再核验 B站（要出网）
+            asked, refuse_reason, answer_record = self._question_gate(settings, payload)
+            if refuse_reason:
+                if answer_record:
+                    # 答错也留一条记录（含判定详情给管理员看），但不把参考答案回给申请人
+                    app_id = self.store.create_application(
+                        qq=qq,
+                        uid=uid,
+                        status="rejected",
+                        reason=refuse_reason,
+                        note=note,
+                        source="auto",
+                        ip=ip,
+                        **answer_record,
+                    )
+                    row = self.store.get_application(app_id) or {}
+                    self.store.log("apply_answer_wrong", actor=f"ip:{ip}", detail=f"qq={qq} detail={answer_record.get('answer_detail', '')[:80]}")
+                    result = self._apply_result(row)
+                    if not wants_json:
+                        return self._html(200, self._render_result_page(result))
+                    return self._json(200, result)
+                return self._apply_refused(refuse_reason, wants_json)
+            if asked and not answer_record:
+                answer_record = {}
 
             rules = self.app.effective_rules(settings)
             taken = ""
@@ -606,6 +673,7 @@ class Handler(BaseHTTPRequestHandler):
                     code=code,
                     source="auto",
                     ip=ip,
+                    **(answer_record or {}),
                 )
             except sqlite3.IntegrityError:
                 # uid 部分唯一索引冲突：同一 UID 已有 pending/approved 记录（并发提交）
@@ -653,6 +721,60 @@ class Handler(BaseHTTPRequestHandler):
             "<p><a class='btn' href='/'>再提交一次</a></p></main></body></html>"
         )
         return body
+
+    def _api_questions(self) -> None:
+        """给申请页取一道题（**绝不返回答案**）。"""
+        settings = self.settings()
+        if not settings.get("web_ask_questions", True):
+            return self._json(200, {"ok": True, "enabled": False, "reason": "本站未开启答题"})
+        bank = self.app.question_bank(settings)
+        usable = self.app.usable_questions(bank)
+        if not usable:
+            return self._json(200, {"ok": True, "enabled": False, "reason": "题库里还没有可用题目"})
+        item = random.choice(usable)
+        return self._json(
+            200,
+            {
+                "ok": True,
+                "enabled": True,
+                "question": str(item.get("question") or ""),
+                "hint": str(item.get("hint") or ""),
+                "total": len(usable),
+                "source": bank["source"],
+            },
+        )
+
+    def _question_gate(
+        self, settings: dict, payload: dict[str, Any]
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """答题校验：返回（是否需要答题, 拒绝原因, 记录字段）。原因非空表示应直接拒绝。"""
+        if not settings.get("web_ask_questions", True):
+            return False, "", {}
+        bank = self.app.question_bank(settings)
+        usable = self.app.usable_questions(bank)
+        if not usable:
+            return False, "", {}
+        asked = str(payload.get("question") or "").strip()
+        answer = str(payload.get("answer") or "").strip()
+        if not asked:
+            return True, "请先在本页回答审核问题再提交", {}
+        entry = next((item for item in usable if str(item.get("question") or "").strip() == asked), None)
+        if entry is None:
+            return True, "题目已更新，请刷新页面重新作答", {}
+        if not answer:
+            return True, "请把审核问题的答案填上", {}
+        mode = matching.resolve_mode(entry.get("match_mode"), bank["match_mode"])
+        passed, detail = matching.evaluate(answer, list(entry.get("answers") or []), mode, bank["common"], bank["threshold"])
+        record = {
+            "question": asked,
+            "answer": answer[:200],
+            "answer_detail": detail,
+            "answer_ok": passed,
+        }
+        if not passed:
+            # 注意：detail 里可能含参考答案，只写进记录给管理员看，不回给申请人
+            return True, "审核问题回答不正确，请再试一次", record
+        return True, "", record
 
     def _api_apply_status(self, ticket: str) -> None:
         row = self.store.find_by_ticket(ticket)
@@ -837,6 +959,8 @@ class Handler(BaseHTTPRequestHandler):
             self.store.set_setting("bili_enabled", bool(payload.get("bili_enabled")))
         if "use_plugin_rules" in payload:
             self.store.set_setting("use_plugin_rules", bool(payload.get("use_plugin_rules")))
+        if "web_ask_questions" in payload:
+            self.store.set_setting("web_ask_questions", bool(payload.get("web_ask_questions")))
         if "bili_on_error" in payload:
             value = str(payload.get("bili_on_error") or "manual").lower()
             self.store.set_setting("bili_on_error", value if value in ("reject", "manual", "pass") else "manual")
@@ -910,13 +1034,111 @@ class Handler(BaseHTTPRequestHandler):
         self.store.log("delete", actor="admin", detail=f"id={app_id}")
         return self._json(200, {"ok": True, "counts": self.store.counts()})
 
+    def _questions_payload(self) -> dict[str, Any]:
+        settings = self.settings()
+        bank = self.app.question_bank(settings)
+        usable = self.app.usable_questions(bank)
+        return {
+            "ok": True,
+            "ask_questions": bool(settings.get("web_ask_questions", True)),
+            "active_source": bank["source"],
+            "active_count": len(usable),
+            "match_mode": bank["match_mode"],
+            "fuzzy_threshold": bank["threshold"],
+            "common_answers": list(bank["common"]),
+            "site_common_answers": list(settings.get("site_common_answers") or []),
+            "site_match_mode": str(settings.get("site_match_mode") or "contains"),
+            "site_fuzzy_threshold": matching.clamp_threshold(settings.get("site_fuzzy_threshold")),
+            # 每题可以写 inherit（跟随全局），但"站点默认方式"本身必须是具体方式
+            "match_mode_options": list(matching.MATCH_MODE_CHOICES),
+            "default_mode_options": list(matching.MATCH_MODES),
+            "site": self.store.list_questions(),
+            "plugin": [
+                dict(item, id=None, source="plugin")
+                for item in (settings.get("plugin_questions") or [])
+                if isinstance(item, dict)
+            ],
+            "plugin_synced_at": float(settings.get("plugin_questions_synced_at") or 0),
+        }
+
+    def _api_admin_questions(self) -> None:
+        if self._require_admin() is None:
+            return
+        return self._json(200, self._questions_payload())
+
+    def _api_admin_save_questions(self) -> None:
+        payload = self._body()
+        if self._require_admin(csrf=str(payload.get("csrf") or "")) is None:
+            return
+        action = str(payload.get("action") or "upsert").strip().lower()
+        if action == "upsert":
+            question = str(payload.get("question") or "").strip()
+            if not question:
+                return self._error(400, "题目内容不能为空")
+            if len(question) > 300:
+                return self._error(400, "题目太长了（最多 300 字）")
+            raw_answers = payload.get("answers")
+            if isinstance(raw_answers, str):
+                raw_answers = [item for item in re.split(r"[\n,，;；、]+", raw_answers) if item.strip()]
+            answers = [str(item).strip()[:120] for item in (raw_answers or []) if str(item).strip()][:30]
+            mode = str(payload.get("match_mode") or "inherit").strip().lower()
+            if mode not in matching.MATCH_MODE_CHOICES:
+                return self._error(400, "匹配方式不合法")
+            hint = str(payload.get("hint") or "").strip()[:200]
+            question_id = self._safe_int(payload.get("id"))
+            new_id = self.store.upsert_question(
+                question=question,
+                answers=answers,
+                hint=hint,
+                match_mode=mode,
+                enabled=bool(payload.get("enabled", True)),
+                question_id=question_id,
+            )
+            self.store.log("question_upsert", actor="admin", detail=f"id={new_id} answers={len(answers)}")
+        elif action == "delete":
+            if not self.store.delete_question(self._safe_int(payload.get("id"))):
+                return self._error(404, "题目不存在")
+            self.store.log("question_delete", actor="admin", detail=f"id={payload.get('id')}")
+        elif action == "toggle":
+            if not self.store.set_question_enabled(self._safe_int(payload.get("id")), bool(payload.get("enabled", True))):
+                return self._error(404, "题目不存在")
+            self.store.log("question_toggle", actor="admin", detail=f"id={payload.get('id')}")
+        elif action == "clear":
+            removed = self.store.clear_questions()
+            self.store.log("question_clear", actor="admin", detail=f"removed={removed}")
+        elif action == "set_ask":
+            self.store.set_setting("web_ask_questions", bool(payload.get("enabled", True)))
+            self.store.log("question_set_ask", actor="admin", detail=str(bool(payload.get("enabled", True))))
+        elif action == "set_common":
+            raw = payload.get("common_answers")
+            if isinstance(raw, str):
+                raw = [item for item in re.split(r"[\n,，;；、]+", raw) if item.strip()]
+            answers = [str(item).strip()[:120] for item in (raw or []) if str(item).strip()][:50]
+            self.store.set_setting("site_common_answers", answers)
+            self.store.log("question_set_common", actor="admin", detail=f"count={len(answers)}")
+        elif action == "set_mode":
+            mode = str(payload.get("match_mode") or "contains").strip().lower()
+            if mode not in matching.MATCH_MODES:
+                return self._error(400, "匹配方式不合法")
+            self.store.set_setting("site_match_mode", mode)
+            if payload.get("fuzzy_threshold") is not None:
+                self.store.set_setting("site_fuzzy_threshold", matching.clamp_threshold(payload.get("fuzzy_threshold")))
+        else:
+            return self._error(400, "未知操作")
+        return self._json(200, self._questions_payload())
+
     def _api_admin_export(self) -> None:
         if self._require_admin() is None:
             return
         rows, _total = self.store.list_applications(status="all", offset=0, limit=100000)
         buffer = io.StringIO()
         writer = csv.writer(buffer, lineterminator="\r\n")
-        writer.writerow(["id", "ticket", "qq", "uid", "bili_name", "level", "fans", "status", "reason", "code", "source", "created_at", "decided_at", "delivered", "note"])
+        writer.writerow(
+            [
+                "id", "ticket", "qq", "uid", "bili_name", "level", "fans", "status", "reason",
+                "question", "answer", "answer_ok", "code", "source", "created_at", "decided_at", "delivered", "note",
+            ]
+        )
         for row in rows:
             writer.writerow(
                 [
@@ -929,6 +1151,9 @@ class Handler(BaseHTTPRequestHandler):
                     row.get("fans"),
                     row.get("status"),
                     row.get("reason"),
+                    csv_safe(row.get("question")),
+                    csv_safe(row.get("answer")),
+                    "" if row.get("answer_ok") is None else ("通过" if row.get("answer_ok") else "未通过"),
                     row.get("code"),
                     row.get("source"),
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("created_at") or 0))),
@@ -992,6 +1217,34 @@ class Handler(BaseHTTPRequestHandler):
             self.store.set_setting("plugin_bindings", bindings)
         if "stats" in payload and isinstance(payload.get("stats"), dict):
             self.store.set_setting("plugin_stats", payload["stats"])
+        if isinstance(payload.get("questions"), list):
+            questions = []
+            for item in payload["questions"][:200]:
+                if not isinstance(item, dict):
+                    continue
+                answers = item.get("answers")
+                if isinstance(answers, str):
+                    answers = re.split(r"[\n,，;；、]+", answers)
+                questions.append(
+                    {
+                        "enabled": bool(item.get("enabled", True)),
+                        "question": str(item.get("question") or "")[:300],
+                        "hint": str(item.get("hint") or "")[:200],
+                        "answers": [str(one).strip()[:120] for one in (answers or []) if str(one).strip()][:30],
+                        "match_mode": str(item.get("match_mode") or "inherit")[:20],
+                    }
+                )
+            self.store.set_setting("plugin_questions", questions)
+            self.store.set_setting("plugin_questions_synced_at", time.time())
+        if isinstance(payload.get("common_answers"), list):
+            self.store.set_setting(
+                "plugin_common_answers",
+                [str(item).strip()[:120] for item in payload["common_answers"] if str(item).strip()][:50],
+            )
+        if payload.get("match_mode"):
+            self.store.set_setting("plugin_match_mode", str(payload["match_mode"])[:20])
+        if payload.get("fuzzy_threshold") is not None:
+            self.store.set_setting("plugin_fuzzy_threshold", matching.clamp_threshold(payload["fuzzy_threshold"]))
         self.store.set_setting("plugin_synced_at", time.time())
         self.store.set_setting("plugin_pull_cursor", str(payload.get("cursor") or self.store.get_setting("plugin_pull_cursor") or ""))
         if payload.get("pulled") is not None:

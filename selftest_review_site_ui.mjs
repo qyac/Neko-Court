@@ -465,7 +465,281 @@ check("csvCell: 空值", () => {
 });
 
 /* ------------------------------------------------------------------ *
- * 10. 静态契约
+ * 10. 网页答题纯函数（题目模型 / 请求体 / 题库统计 / chips）
+ * ------------------------------------------------------------------ */
+
+check("网页答题常量与后端一致", () => {
+  assert.equal(F.ANSWER_MAX, 200);
+  assert.equal(F.QUESTION_MAX, 300);
+  assert.equal(F.DEFAULT_MATCH_MODE, "contains");
+  assert.equal(F.DEFAULT_FUZZY_THRESHOLD, 0.8);
+  assert.equal(F.MIN_FUZZY_THRESHOLD, 0.5);
+  assert.equal(F.MAX_FUZZY_THRESHOLD, 1);
+  assert.deepEqual(F.MATCH_MODE_OPTIONS, ["inherit", "contains", "exact", "regex", "fuzzy"]);
+  assert.equal(F.MATCH_MODE_LABELS.inherit, "跟随全局");
+  assert.equal(F.QUESTION_SOURCE_LABELS.plugin, "插件题库");
+});
+
+check("normalizeQuestion: 完整数据去空格", () => {
+  assert.deepEqual(
+    F.normalizeQuestion({
+      enabled: true,
+      question: " 1+1=? ",
+      hint: " 很简单 ",
+      total: 3,
+      source: "plugin",
+    }),
+    { enabled: true, question: "1+1=?", hint: "很简单", total: 3, source: "plugin" },
+  );
+});
+
+check("normalizeQuestion: 脏数据兜底（null/undefined/数字/字符串/数组/空对象）", () => {
+  for (const bad of [null, undefined, 0, 7, "1+1=?", [], true, {}, { enabled: null, total: null }]) {
+    const out = F.normalizeQuestion(bad);
+    assert.equal(out.enabled, false);
+    assert.equal(out.question, "");
+    assert.equal(out.hint, "");
+    assert.equal(out.total, 0);
+    assert.equal(out.source, "site");
+  }
+  assert.deepEqual(F.normalizeQuestion(), {
+    enabled: false,
+    question: "",
+    hint: "",
+    total: 0,
+    source: "site",
+  });
+});
+
+check("normalizeQuestion: enabled 脏值", () => {
+  assert.equal(F.normalizeQuestion({ enabled: true }).enabled, true);
+  assert.equal(F.normalizeQuestion({ enabled: "true" }).enabled, true);
+  assert.equal(F.normalizeQuestion({ enabled: " on " }).enabled, true);
+  assert.equal(F.normalizeQuestion({ enabled: 1 }).enabled, true);
+  assert.equal(F.normalizeQuestion({ enabled: false }).enabled, false);
+  assert.equal(F.normalizeQuestion({ enabled: "false" }).enabled, false);
+  assert.equal(F.normalizeQuestion({ enabled: "0" }).enabled, false);
+  assert.equal(F.normalizeQuestion({ enabled: 0 }).enabled, false);
+  assert.equal(F.normalizeQuestion({ enabled: "" }).enabled, false);
+});
+
+check("normalizeQuestion: total 脏值（0 / 小数 / 负数 / 非数字）", () => {
+  assert.equal(F.normalizeQuestion({ total: 1 }).total, 1);
+  assert.equal(F.normalizeQuestion({ total: "5" }).total, 5);
+  assert.equal(F.normalizeQuestion({ total: 2.9 }).total, 2);
+  assert.equal(F.normalizeQuestion({ total: 0 }).total, 0);
+  assert.equal(F.normalizeQuestion({ total: -3 }).total, 0);
+  assert.equal(F.normalizeQuestion({ total: "abc" }).total, 0);
+  assert.equal(F.normalizeQuestion({ total: NaN }).total, 0);
+  assert.equal(F.normalizeQuestion({ total: Infinity }).total, 0);
+});
+
+check("normalizeQuestion: source 归一化（未知 → site）", () => {
+  assert.equal(F.normalizeQuestion({ source: "plugin" }).source, "plugin");
+  assert.equal(F.normalizeQuestion({ source: " PLUGIN " }).source, "plugin");
+  assert.equal(F.normalizeQuestion({ source: "site" }).source, "site");
+  assert.equal(F.normalizeQuestion({ source: "other" }).source, "site");
+  assert.equal(F.normalizeQuestion({ source: "" }).source, "site");
+});
+
+check("hasQuestion: 全枚举", () => {
+  assert.equal(F.hasQuestion({ enabled: true, question: "1+1=?" }), true);
+  assert.equal(F.hasQuestion({ enabled: true, question: " 1+1=? " }), true);
+  assert.equal(F.hasQuestion({ enabled: "true", question: "1+1=?" }), true);
+  assert.equal(F.hasQuestion({ enabled: true }), false);
+  assert.equal(F.hasQuestion({ enabled: true, question: "" }), false);
+  assert.equal(F.hasQuestion({ enabled: true, question: "   " }), false);
+  assert.equal(F.hasQuestion({ enabled: false, question: "1+1=?" }), false);
+  assert.equal(F.hasQuestion({}), false);
+  assert.equal(F.hasQuestion(null), false);
+  assert.equal(F.hasQuestion(undefined), false);
+});
+
+check("validateAnswerInput: 不需要答题时永远通过", () => {
+  assert.equal(F.validateAnswerInput(false, ""), null);
+  assert.equal(F.validateAnswerInput(false, "   "), null);
+  assert.equal(F.validateAnswerInput(false, null), null);
+  assert.equal(F.validateAnswerInput(false, undefined), null);
+  assert.equal(F.validateAnswerInput(undefined, ""), null);
+});
+
+check("validateAnswerInput: 需要答题且答案为空 → 就地错误文案", () => {
+  assert.match(F.validateAnswerInput(true, ""), /回答/);
+  assert.match(F.validateAnswerInput(true, "   "), /回答/);
+  assert.match(F.validateAnswerInput(true, null), /回答/);
+  assert.match(F.validateAnswerInput(true, undefined), /回答/);
+  assert.equal(F.validateAnswerInput(true, "2"), null);
+  assert.equal(F.validateAnswerInput(true, " 2 "), null);
+});
+
+check("buildApplyPayload: 不需要答题时不带 question/answer 键", () => {
+  const out = F.buildApplyPayload({
+    qq: "12345",
+    uid: "12345678",
+    note: "",
+    question: "",
+    answer: "2",
+  });
+  assert.deepEqual(out, { qq: "12345", uid: "12345678", note: "" });
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "question"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "answer"), false);
+
+  const blank = F.buildApplyPayload({
+    qq: "12345",
+    uid: "12345678",
+    question: "   ",
+    answer: "2",
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(blank, "question"), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(blank, "answer"), false);
+  assert.deepEqual(F.buildApplyPayload(), { qq: "", uid: "", note: "" });
+});
+
+check("buildApplyPayload: 有题目时带 question/answer 且 trim", () => {
+  assert.deepEqual(
+    F.buildApplyPayload({
+      qq: " 12345 ",
+      uid: "12345678",
+      note: " 你好 ",
+      question: " 1+1=? ",
+      answer: " 2 ",
+    }),
+    { qq: "12345", uid: "12345678", note: "你好", question: "1+1=?", answer: "2" },
+  );
+});
+
+check("buildApplyPayload: 有题目但没填答案 → answer 为空串（键仍在）", () => {
+  const out = F.buildApplyPayload({ qq: "12345", uid: "12345678", question: "1+1=?", answer: null });
+  assert.equal(out.question, "1+1=?");
+  assert.equal(out.answer, "");
+  assert.equal(Object.prototype.hasOwnProperty.call(out, "answer"), true);
+});
+
+check("sortQuestions: 站点在前、插件在后且各自稳定", () => {
+  const siteA = { id: 1, source: "site", question: "A" };
+  const siteB = { id: 2, source: "site", question: "B" };
+  const plugA = { id: null, source: "plugin", question: "P1" };
+  const plugB = { id: null, source: "plugin", question: "P2" };
+  assert.deepEqual(F.sortQuestions([plugA, siteA, plugB, siteB]), [siteA, siteB, plugA, plugB]);
+  assert.deepEqual(F.sortQuestions([siteA, siteB, plugA]), [siteA, siteB, plugA]);
+  assert.equal(F.sortQuestions([plugA])[0], plugA);
+  assert.equal(F.sortQuestions([siteA])[0], siteA);
+  assert.deepEqual(F.sortQuestions([]), []);
+});
+
+check("sortQuestions: 脏数据兜底", () => {
+  assert.deepEqual(F.sortQuestions(null), []);
+  assert.deepEqual(F.sortQuestions(undefined), []);
+  assert.deepEqual(F.sortQuestions("x"), []);
+  const noSource = F.sortQuestions([{ id: 9, question: "无 source" }]);
+  assert.equal(noSource.length, 1);
+  assert.equal(noSource[0].id, 9);
+  assert.equal(F.sortQuestions([{ source: "PLUGIN" }])[0].source, "PLUGIN");
+  assert.equal(F.sortQuestions([null, { source: "site" }]).length, 2);
+});
+
+check("questionStats: 完整数据", () => {
+  assert.deepEqual(
+    F.questionStats({
+      site: [{ id: 1 }, { id: 2 }, { id: 3 }],
+      plugin: [{ question: "p" }],
+      active_count: 4,
+      active_source: "site",
+      ask_questions: true,
+    }),
+    { siteCount: 3, pluginCount: 1, activeCount: 4, source: "site", askEnabled: true },
+  );
+});
+
+check("questionStats: 空题库（total=0）与脏数据", () => {
+  const empty = { siteCount: 0, pluginCount: 0, activeCount: 0, source: "", askEnabled: true };
+  assert.deepEqual(F.questionStats({ site: [], plugin: [], active_count: 0, active_source: "" }), empty);
+  assert.deepEqual(F.questionStats({}), empty);
+  assert.deepEqual(F.questionStats(null), empty);
+  assert.deepEqual(F.questionStats(undefined), empty);
+  assert.deepEqual(F.questionStats("x"), empty);
+  assert.deepEqual(F.questionStats([]), empty);
+});
+
+check("questionStats: 来源 / 计数 / 开关的脏值", () => {
+  assert.equal(F.questionStats({ active_source: " PLUGIN " }).source, "plugin");
+  assert.equal(F.questionStats({ active_source: "nope" }).source, "");
+  assert.equal(F.questionStats({ active_count: -1 }).activeCount, 0);
+  assert.equal(F.questionStats({ active_count: "2" }).activeCount, 2);
+  assert.equal(F.questionStats({ active_count: 1.8 }).activeCount, 1);
+  assert.equal(F.questionStats({ site: "x", plugin: 5 }).siteCount, 0);
+  assert.equal(F.questionStats({ site: "x", plugin: 5 }).pluginCount, 0);
+  assert.equal(F.questionStats({ ask_questions: false }).askEnabled, false);
+  assert.equal(F.questionStats({ ask_questions: "false" }).askEnabled, false);
+  assert.equal(F.questionStats({ ask_questions: 0 }).askEnabled, false);
+  assert.equal(F.questionStats({ ask_questions: null }).askEnabled, true);
+});
+
+check("matchModeLabel: 全枚举", () => {
+  assert.equal(F.matchModeLabel("inherit"), "跟随全局");
+  assert.equal(F.matchModeLabel("contains"), "包含关键词");
+  assert.equal(F.matchModeLabel("exact"), "完全相等");
+  assert.equal(F.matchModeLabel("regex"), "正则");
+  assert.equal(F.matchModeLabel("fuzzy"), "模糊相似");
+});
+
+check("matchModeLabel: 未知原样 / 大小写 / 空值", () => {
+  assert.equal(F.matchModeLabel("nope"), "nope");
+  assert.equal(F.matchModeLabel(" fuzzy "), "模糊相似");
+  assert.equal(F.matchModeLabel("INHERIT"), "跟随全局");
+  assert.equal(F.matchModeLabel(""), "");
+  assert.equal(F.matchModeLabel(null), "");
+  assert.equal(F.matchModeLabel(undefined), "");
+  assert.equal(F.matchModeLabel(7), "7");
+});
+
+check("questionSourceLabel: 枚举与未知", () => {
+  assert.equal(F.questionSourceLabel("site"), "站点题库");
+  assert.equal(F.questionSourceLabel("plugin"), "插件题库");
+  assert.equal(F.questionSourceLabel(" PLUGIN "), "插件题库");
+  assert.equal(F.questionSourceLabel("other"), "other");
+  assert.equal(F.questionSourceLabel(null), "");
+});
+
+check("parseListInput: 分隔符 / 去重 / 去空", () => {
+  assert.deepEqual(F.parseListInput("a, b，c、d；e;f\ng"), ["a", "b", "c", "d", "e", "f", "g"]);
+  assert.deepEqual(F.parseListInput("a, a , b"), ["a", "b"]);
+  assert.deepEqual(F.parseListInput(["a", " a ", "", "b"]), ["a", "b"]);
+  assert.deepEqual(F.parseListInput("  "), []);
+  assert.deepEqual(F.parseListInput(""), []);
+  assert.deepEqual(F.parseListInput(null), []);
+  assert.deepEqual(F.parseListInput(undefined), []);
+  assert.deepEqual(F.parseListInput(123), ["123"]);
+  assert.deepEqual(F.parseListInput([" "]), []);
+});
+
+check("chipsToText: 列表 → 逗号分隔文本", () => {
+  assert.equal(F.chipsToText(["a", "b"]), "a, b");
+  assert.equal(F.chipsToText([" a ", "a", "b"]), "a, b");
+  assert.equal(F.chipsToText([]), "");
+  assert.equal(F.chipsToText(null), "");
+  assert.equal(F.chipsToText(undefined), "");
+  assert.equal(F.chipsToText("a,b"), "a, b");
+});
+
+check("normalizeThreshold: 0.5~1.0 区间与脏数据", () => {
+  assert.equal(F.normalizeThreshold(0.8), 0.8);
+  assert.equal(F.normalizeThreshold(0.5), 0.5);
+  assert.equal(F.normalizeThreshold(1), 1);
+  assert.equal(F.normalizeThreshold(1.4), 1);
+  assert.equal(F.normalizeThreshold(0.1), 0.5);
+  assert.equal(F.normalizeThreshold("0.75"), 0.75);
+  assert.equal(F.normalizeThreshold("abc"), 0.8);
+  assert.equal(F.normalizeThreshold(null), 0.8);
+  assert.equal(F.normalizeThreshold(undefined), 0.8);
+  assert.equal(F.normalizeThreshold(NaN), 0.8);
+  assert.equal(F.normalizeThreshold(Infinity), 0.8);
+  assert.equal(F.normalizeThreshold(0.6, 0.9), 0.6);
+  assert.equal(F.normalizeThreshold(undefined, "abc"), 0.8);
+});
+
+/* ------------------------------------------------------------------ *
+ * 11. 静态契约
  * ------------------------------------------------------------------ */
 
 const ALLOWED_PLACEHOLDERS = {
@@ -648,6 +922,17 @@ check("静态检查: form.js 导出全部约定函数", () => {
     "nextOffset",
     "prevOffset",
     "csvCell",
+    // 网页答题（新增）
+    "normalizeQuestion",
+    "hasQuestion",
+    "validateAnswerInput",
+    "sortQuestions",
+    "questionStats",
+    "matchModeLabel",
+    "questionSourceLabel",
+    "parseListInput",
+    "chipsToText",
+    "normalizeThreshold",
   ];
   for (const name of required) {
     assert.equal(typeof F[name], "function", `form.js 未导出函数：${name}`);
@@ -716,8 +1001,179 @@ check("静态检查: 管理后台包含写操作的二次确认与提示", () =>
   }
 });
 
+/* ---------- 网页答题：静态契约 ---------- */
+
+check("静态检查: apply.html 审核问题区域（原有占位符仍在）", () => {
+  const html = readText(APPLY_HTML);
+  for (const needle of [
+    "$site_name",
+    "$site_subtitle",
+    "$group_line",
+    "$rules_line",
+    "$notice_html",
+    "$footer_html",
+    'id="question-block"',
+    'id="question-text"',
+    'id="question-hint"',
+    'id="question-answer"',
+    'id="question-answer-error"',
+    'id="question-text-hidden"',
+    'id="question-actions"',
+    'id="question-notice"',
+    'for="question-answer"',
+    'aria-describedby="question-hint question-answer-error"',
+    'aria-labelledby="question-legend"',
+    "<fieldset",
+    "<legend",
+  ]) {
+    assert.ok(html.includes(needle), `apply.html 缺少：${needle}`);
+  }
+
+  // 答题区域必须夹在「备注」与「提交按钮」之间
+  const noteAt = html.indexOf('id="note"');
+  const blockAt = html.indexOf('id="question-block"');
+  const submitAt = html.indexOf('id="apply-submit"');
+  assert.ok(noteAt >= 0, "apply.html 找不到备注字段");
+  assert.ok(blockAt > noteAt, "审核问题区域应放在备注字段之后");
+  assert.ok(submitAt > blockAt, "提交按钮应放在审核问题区域之后");
+});
+
+check("静态检查: app.js 申请页读取题目容器并调用 ./api/questions", () => {
+  const js = readText(APP_JS);
+  for (const needle of [
+    "document.getElementById",
+    'byId("question-block")',
+    'byId("question-text")',
+    'byId("question-answer")',
+    'byId("question-text-hidden")',
+    'byId("question-actions")',
+    'byId("question-notice")',
+    "./api/questions",
+    "normalizeQuestion",
+    "hasQuestion",
+    "validateAnswerInput",
+    "换一题",
+    "审核问题加载失败，可直接提交或刷新页面",
+    "重新填写",
+    "answer",
+  ]) {
+    assert.ok(js.includes(needle), `app.js 缺少：${needle}`);
+  }
+  // 题目原文随提交发送（隐藏字段 → buildApplyPayload）
+  assert.ok(
+    /question:\s*questionReady[\s\S]{0,140}answer:\s*questionAnswer/.test(js),
+    "app.js 应把题目原文与答案一起放进请求体",
+  );
+});
+
+check("静态检查: 申请页拿不到也不显示参考答案", () => {
+  const html = readText(APPLY_HTML);
+  for (const bad of ["参考答案", "answers", "correct"]) {
+    assert.ok(!html.includes(bad), `apply.html 不应出现：${bad}`);
+  }
+  const form = readText(FORM_JS);
+  assert.ok(!form.includes("answers"), "form.js 不应保存参考答案");
+});
+
+check("静态检查: admin.html 题库分区与原有占位符", () => {
+  const html = readText(ADMIN_HTML);
+  for (const needle of [
+    "$site_name",
+    "$plugin_status_html",
+    "$stats_html",
+    "$csrf",
+    "$logout_url",
+    "$footer_html",
+    "$initial_json",
+    'id="questions-panel"',
+    'id="questions-status"',
+    'id="ask-questions"',
+    'id="site-match-mode"',
+    'id="site-fuzzy-threshold"',
+    'id="site-common-editor"',
+    'id="site-questions"',
+    'id="plugin-questions"',
+    'id="questions-refresh"',
+    'id="question-add"',
+    'id="questions-clear"',
+    'id="plugin-synced-at"',
+    "<details",
+    "<fieldset",
+    "<legend",
+    "尚未同步",
+    "站点题库为空时，网页会用插件同步过来的题目",
+    "来自 QQ 插件（改它请到 AstrBot 插件配置）",
+  ]) {
+    assert.ok(html.includes(needle), `admin.html 缺少：${needle}`);
+  }
+  // 题库分区挨着设置分区，且在 <main> 里
+  const settingsAt = html.indexOf('id="settings-title"');
+  const panelAt = html.indexOf('id="questions-panel"');
+  assert.ok(settingsAt >= 0 && panelAt > settingsAt, "题库分区应放在站点设置附近（设置之后）");
+});
+
+check("静态检查: app.js 使用题库接口与全部 action", () => {
+  const js = readText(APP_JS);
+  for (const needle of [
+    "./api/admin/questions",
+    "./api/questions",
+    '"upsert"',
+    '"delete"',
+    '"clear"',
+    '"toggle"',
+    '"set_ask"',
+    '"set_common"',
+    '"set_mode"',
+    "当前出题来源",
+    "尚未同步",
+    "站点题库为空时",
+    "来自 QQ 插件",
+    "questionStats",
+    "sortQuestions",
+    "matchModeLabel",
+    "parseListInput",
+    "chipsToText",
+    "normalizeThreshold",
+    "restoreControls",
+    "window.confirm",
+    "清空站点题库",
+    "新增题目",
+  ]) {
+    assert.ok(js.includes(needle), `app.js 缺少：${needle}`);
+  }
+});
+
+check("契约检查: 题库 action 与 app.py 后端一致", () => {
+  const source = readText(path.join(SITE_DIR, "app.py"));
+  for (const action of ["upsert", "delete", "toggle", "clear", "set_ask", "set_common", "set_mode"]) {
+    assert.ok(
+      source.includes(`action == "${action}"`),
+      `app.py 缺少题库 action：${action}`,
+    );
+  }
+  assert.ok(source.includes('if path == "/api/admin/questions":'), "app.py 缺少 /api/admin/questions 路由");
+  assert.ok(source.includes('if path == "/api/questions":'), "app.py 缺少 /api/questions 路由");
+  // 后端只下发题干/提示，绝不把参考答案给申请页
+  const bankStart = source.indexOf("def _api_questions(");
+  const bankEnd = source.indexOf("def _question_gate(");
+  assert.ok(bankStart >= 0 && bankEnd > bankStart, "app.py 缺少 _api_questions / _question_gate");
+  assert.ok(
+    !source.slice(bankStart, bankEnd).includes('"answers"'),
+    "_api_questions 不应把 answers 下发给申请页",
+  );
+});
+
+check("静态检查: 模板不含 bridge-sdk / cdn / 上级目录", () => {
+  for (const [name, file] of Object.entries(TEMPLATE_FILES)) {
+    const html = readText(file);
+    for (const bad of ["bridge-sdk", "cdn", "../"]) {
+      assert.ok(!html.includes(bad), `${name} 不应包含：${bad}`);
+    }
+  }
+});
+
 /* ------------------------------------------------------------------ *
- * 11. 渲染模拟（近似 Python string.Template）
+ * 12. 渲染模拟（近似 Python string.Template）
  * ------------------------------------------------------------------ */
 
 /** 用给定变量近似 string.Template 的 $name / ${name} 替换。 */
@@ -821,6 +1277,20 @@ check("渲染模拟: admin 首屏数据块可直接 JSON.parse", () => {
   assert.equal(parsed.settings.plugin_token, "");
 });
 
+check("渲染模拟: 题库 / 答题区域渲染后仍然完整", () => {
+  const apply = renderTemplate(readText(APPLY_HTML), SAMPLE_VALUES["apply.html"]);
+  assert.ok(apply.includes('id="question-block"'), "apply.html 渲染后缺少审核问题区域");
+  assert.ok(apply.includes('id="question-notice"'), "apply.html 渲染后缺少题目提示条");
+  assert.ok(apply.includes('id="apply-submit"'), "apply.html 渲染后缺少提交按钮");
+  assert.ok(apply.indexOf('id="question-block"') < apply.indexOf('id="apply-submit"'));
+
+  const admin = renderTemplate(readText(ADMIN_HTML), SAMPLE_VALUES["admin.html"]);
+  assert.ok(admin.includes('id="questions-panel"'), "admin.html 渲染后缺题库分区");
+  assert.ok(admin.includes('id="questions-status"'), "admin.html 渲染后缺状态行");
+  assert.ok(admin.includes('id="site-questions"') && admin.includes('id="plugin-questions"'));
+  assert.ok(admin.includes('content="csrf-token-123"'), "题库分区不应破坏 csrf meta");
+});
+
 check("契约检查: 模板占位符与 render.py 提供的变量一一对应", () => {
   const source = readText(path.join(SITE_DIR, "render.py"));
   const pairs = [
@@ -844,7 +1314,7 @@ check("契约检查: 模板占位符与 render.py 提供的变量一一对应", 
 });
 
 /* ------------------------------------------------------------------ *
- * 12. app.js 语法冒烟
+ * 13. app.js 语法冒烟
  * ------------------------------------------------------------------ */
 
 check("语法检查: app.js 去掉 import 后可作为函数体编译（无语法错误）", () => {

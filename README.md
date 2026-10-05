@@ -6,7 +6,7 @@ AstrBot 插件项目。目前包含一个专门用于管理**临时审核群**�
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| [astrbot_plugin_temp_review_group](astrbot_plugin_temp_review_group/README.md) | v1.1.8 | 临时审核群管理：每日定时清理普通成员、新人入群自动提问、答错 N 次踢出、答对私聊下发当日验证码；判定可选规则或大模型；验证码每日轮换，支持管理员查询/设定/重置/补发 |
+| [astrbot_plugin_temp_review_group](astrbot_plugin_temp_review_group/README.md) | v1.1.9 | 临时审核群管理：每日定时清理普通成员、新人入群自动提问、答错 N 次踢出、答对私聊下发当日验证码；判定可选规则或大模型；验证码每日轮换，支持管理员查询/设定/重置/补发 |
 
 `astrbot_plugin_temp_review_group` 的能力：
 
@@ -14,6 +14,7 @@ AstrBot 插件项目。目前包含一个专门用于管理**临时审核群**�
 - **入群审核**：新人入群先发**可单独配置的欢迎语**（默认合成一条：欢迎语 + 问题 + 提示，@ 新人），答错累计到上限移出，答对下发当日验证码（默认走 **QQ 群临时会话**私发，成员无需加机器人好友；可切换群内/两处，两条私聊通道都失败时可回退群内或用指令补发）；
 - **判定方式可选**：`rule` 关键词/精确/正则/**模糊相似度**、`llm` 交给大模型判同义表述、`hybrid` 规则先命中省额度；模型超时/报错/不可用时自动回退规则，不会因模型故障误踢人；
 - **问题库 / 答案库**：每题可单独启用停用、加提示、配答案库与匹配方式，另有通用答案库（邀请码）与模糊阈值；`/审核 题库` 看抽中/通过统计，`/审核 试答 [#题号] <回答>` 先验证某句话会不会通过再调库；
+- **网页答题（可选）**：入群问题会随同步下发到网站，申请人要在网页上答对才通过（网站后台还能另配一套题库、通用答案库与匹配方式），判定逻辑与 QQ 侧逐字一致；
 - **审核网站（可选）**：**内置在插件里**（打开 `web_site_enabled` 即可，随插件启动、自动同步验证码与规则），也可用 `review-site/serve.py` 独立部署；申请人在网页上填 QQ + B站 UID，通过后网页直接显示当日验证码；插件主动出站同步验证码/规则并拉取通过名单，这些人入群时不再被提问；
 - **B站 UID 审核（可选）**：回答必须是成员的 B站 UID，插件调 B站接口核验账号（等级/粉丝/昵称关键词/一 UID 一 QQ），判定确定且不消耗模型额度；提供 `/审核 查UID`、`/审核 解绑`；
 - **验证码轮换**：每天定时用 `secrets` 重新生成，跨天以「最近一次重置时刻」为界；机器人停机期间错过的重置/清理会在启动后补做；
@@ -45,10 +46,10 @@ Neko-Court/
 │  ├─ pages/questions/                 # Dashboard 题库管理页（展开式列表 + 大模型自动填入）
 │  ├─ review_web/                      # 审核网站实现（内置：随插件启动；也可独立部署）
 │  └─ .astrbot-plugin/i18n/            # 页面标题/描述国际化
-├─ selftest_temp_review_group.py       # 插件后端自检（桩替 astrbot.*，462 项断言）
+├─ selftest_temp_review_group.py       # 插件后端自检（桩替 astrbot.*，472 项断言）
 ├─ selftest_settings_page.mjs          # 设置页自检（Node，12 项断言）
 ├─ selftest_questions_page.mjs         # 题库页自检（Node，10 项断言）
-├─ selftest_review_site.py             # 审核网站后端自检（159 项，含安全回归与诊断脚本）
+├─ selftest_review_site.py             # 审核网站后端自检（196 项，含安全回归、诊断脚本与网页答题）
 ├─ selftest_review_site_ui.mjs         # 审核网站前端自检（Node，74 项断言）
 ├─ review-site/serve.py                # 站点独立部署的启动器（实现就是插件里的 review_web/）
 ├─ tools/package_plugin.py             # 插件打包脚本：排除缓存、固定时间戳、产物自检
@@ -88,7 +89,7 @@ TEMP_REVIEW_PLUGIN_DIR=/path/to/extracted/astrbot_plugin_temp_review_group node 
 
 ## 发布
 
-约定：`metadata.yaml` 的 `version` = git 标签名 = 产物文件名里的版本号（当前都是 `v1.1.8`）。
+约定：`metadata.yaml` 的 `version` = git 标签名 = 产物文件名里的版本号（当前都是 `v1.1.9`）。
 
 ```powershell
 # 1) 推送（Git Credential Manager 会弹一次浏览器登录）
@@ -96,15 +97,15 @@ git push -u origin main --tags
 
 # 2) 建 Release + 上传产物，两种方式任选
 #    方式一：Web UI
-#      https://github.com/qyac/Neko-Court/releases/new?tag=v1.1.8
-#      标题：astrbot_plugin_temp_review_group v1.1.8
-#      说明：粘贴 dist/RELEASE_NOTES-v1.1.8.md
-#      附件：dist/astrbot_plugin_temp_review_group-v1.1.8.zip
+#      https://github.com/qyac/Neko-Court/releases/new?tag=v1.1.9
+#      标题：astrbot_plugin_temp_review_group v1.1.9
+#      说明：粘贴 dist/RELEASE_NOTES-v1.1.9.md
+#      附件：dist/astrbot_plugin_temp_review_group-v1.1.9.zip
 #    方式二：脚本（需要一个 Contents 读写权限的 token，仅从环境变量读取，不落盘、不回显）
 $env:GITHUB_TOKEN = "<PAT>"
-python tools/create_release.py --tag v1.1.8 `
-  --notes-file dist/RELEASE_NOTES-v1.1.8.md `
-  --asset dist/astrbot_plugin_temp_review_group-v1.1.8.zip
+python tools/create_release.py --tag v1.1.9 `
+  --notes-file dist/RELEASE_NOTES-v1.1.9.md `
+  --asset dist/astrbot_plugin_temp_review_group-v1.1.9.zip
 ```
 
 `tools/create_release.py` 支持 `--dry-run`（只打印计划）、`--draft`、`--prerelease`、
@@ -113,7 +114,7 @@ python tools/create_release.py --tag v1.1.8 `
 
 ## 版本
 
-当前：**v1.1.8**（与 `astrbot_plugin_temp_review_group/metadata.yaml` 的 `version` 一致，打包文件名也取自它）。
+当前：**v1.1.9**（与 `astrbot_plugin_temp_review_group/metadata.yaml` 的 `version` 一致，打包文件名也取自它）。
 
 ## 许可
 

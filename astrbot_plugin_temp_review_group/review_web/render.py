@@ -249,6 +249,7 @@ def public_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "plugin_token": "",  # 永不回显
         "apply_per_ip": int(settings.get("apply_per_ip") or 10),
         "apply_per_qq": int(settings.get("apply_per_qq") or 3),
+        "web_ask_questions": bool(settings.get("web_ask_questions", True)),
     }
 
 

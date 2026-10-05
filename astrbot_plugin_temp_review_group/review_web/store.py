@@ -46,6 +46,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "plugin_rules": {},
     "plugin_bindings": {},
     "plugin_synced_at": 0,
+    "plugin_questions": [],          # 插件同步过来的题库
+    "plugin_common_answers": [],
+    "plugin_match_mode": "contains",
+    "plugin_fuzzy_threshold": 0.8,
+    "plugin_questions_synced_at": 0,
+    "web_ask_questions": True,       # 网页是否要求答题（没有可用题目时自动跳过）
+    "site_common_answers": [],       # 站点自己的通用答案库
+    "site_match_mode": "contains",   # 站点题库的默认匹配方式（题目写 inherit 时用它）
+    "site_fuzzy_threshold": 0.8,
     "plugin_groups": [],
     "plugin_stats": {},
 }
@@ -68,12 +77,26 @@ CREATE TABLE IF NOT EXISTS applications (
     decided_at REAL,
     ip TEXT NOT NULL DEFAULT '',
     delivered INTEGER NOT NULL DEFAULT 0,
-    delivered_at REAL
+    delivered_at REAL,
+    question TEXT NOT NULL DEFAULT '',
+    answer TEXT NOT NULL DEFAULT '',
+    answer_detail TEXT NOT NULL DEFAULT '',
+    answer_ok INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_app_status ON applications(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_app_qq ON applications(qq, created_at DESC);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_app_uid_active
     ON applications(uid) WHERE status IN ('pending', 'approved');
+CREATE TABLE IF NOT EXISTS questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    question TEXT NOT NULL,
+    hint TEXT NOT NULL DEFAULT '',
+    answers TEXT NOT NULL DEFAULT '[]',
+    match_mode TEXT NOT NULL DEFAULT 'inherit',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS blocklist (
     qq TEXT PRIMARY KEY,
     at REAL NOT NULL,
@@ -101,6 +124,22 @@ class Store:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """给老数据库补上后来加的列（SQLite 没有 ADD COLUMN IF NOT EXISTS）。"""
+        wanted = {
+            "question": "TEXT NOT NULL DEFAULT ''",
+            "answer": "TEXT NOT NULL DEFAULT ''",
+            "answer_detail": "TEXT NOT NULL DEFAULT ''",
+            "answer_ok": "INTEGER",
+        }
+        with self._connect() as conn:
+            existing = {row["name"] for row in conn.execute("PRAGMA table_info(applications)")}
+            for column, ddl in wanted.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE applications ADD COLUMN {column} {ddl}")
+            conn.commit()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path, timeout=10.0)
@@ -158,13 +197,18 @@ class Store:
         code: str = "",
         source: str = "auto",
         ip: str = "",
+        question: str = "",
+        answer: str = "",
+        answer_detail: str = "",
+        answer_ok: bool | None = None,
     ) -> int:
         ticket = ticket or secrets.token_hex(16)
         with self._connect() as conn:
             cursor = conn.execute(
                 "INSERT INTO applications"
-                "(ticket, qq, uid, uid_name, level, fans, status, reason, note, code, source, created_at, ip)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(ticket, qq, uid, uid_name, level, fans, status, reason, note, code, source, created_at, ip,"
+                " question, answer, answer_detail, answer_ok)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     ticket,
                     qq,
@@ -179,6 +223,10 @@ class Store:
                     source,
                     time.time(),
                     ip,
+                    question,
+                    answer,
+                    answer_detail,
+                    None if answer_ok is None else int(bool(answer_ok)),
                 ),
             )
             conn.commit()
@@ -255,6 +303,10 @@ class Store:
             "source": str(row.get("source") or ""),
             "ip": str(row.get("ip") or ""),
             "delivered": int(row.get("delivered") or 0),
+            "question": str(row.get("question") or ""),
+            "answer": str(row.get("answer") or ""),
+            "answer_detail": str(row.get("answer_detail") or ""),
+            "answer_ok": None if row.get("answer_ok") is None else bool(row.get("answer_ok")),
             "created_at": float(row.get("created_at") or 0),
             "decided_at": row.get("decided_at"),
         }
@@ -345,6 +397,85 @@ class Store:
                 "FROM applications WHERE status = 'approved' ORDER BY id DESC LIMIT 500"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------ 题目（站点题库）
+
+    def list_questions(self, *, only_enabled: bool = False) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM questions"
+        if only_enabled:
+            sql += " WHERE enabled = 1"
+        sql += " ORDER BY id ASC"
+        with self._connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                answers = json.loads(row["answers"] or "[]")
+            except (TypeError, ValueError):
+                answers = []
+            items.append(
+                {
+                    "id": int(row["id"]),
+                    "enabled": bool(row["enabled"]),
+                    "question": str(row["question"] or ""),
+                    "hint": str(row["hint"] or ""),
+                    "answers": [str(item) for item in answers if str(item).strip()],
+                    "match_mode": str(row["match_mode"] or "inherit"),
+                    "source": "site",
+                    "created_at": float(row["created_at"] or 0),
+                    "updated_at": float(row["updated_at"] or 0),
+                }
+            )
+        return items
+
+    def upsert_question(
+        self,
+        *,
+        question: str,
+        answers: list[str],
+        hint: str = "",
+        match_mode: str = "inherit",
+        enabled: bool = True,
+        question_id: int = 0,
+    ) -> int:
+        now = time.time()
+        payload = json.dumps([str(item) for item in answers], ensure_ascii=False)
+        with self._connect() as conn:
+            if question_id:
+                conn.execute(
+                    "UPDATE questions SET enabled=?, question=?, hint=?, answers=?, match_mode=?, updated_at=? WHERE id=?",
+                    (int(bool(enabled)), question, hint, payload, match_mode, now, int(question_id)),
+                )
+                conn.commit()
+                return int(question_id)
+            cursor = conn.execute(
+                "INSERT INTO questions(enabled, question, hint, answers, match_mode, created_at, updated_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (int(bool(enabled)), question, hint, payload, match_mode, now, now),
+            )
+            conn.commit()
+            return int(cursor.lastrowid)
+
+    def set_question_enabled(self, question_id: int, enabled: bool) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE questions SET enabled=?, updated_at=? WHERE id=?",
+                (int(bool(enabled)), time.time(), int(question_id)),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def delete_question(self, question_id: int) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM questions WHERE id=?", (int(question_id),))
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def clear_questions(self) -> int:
+        with self._connect() as conn:
+            cursor = conn.execute("DELETE FROM questions")
+            conn.commit()
+            return int(cursor.rowcount)
 
     # ------------------------------------------------------------------ 拉黑
 
