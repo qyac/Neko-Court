@@ -82,7 +82,7 @@ python review-site/serve.py --print-config
 ## 申请人流程
 
 1. 打开申请页，填 **QQ 号** 与 **B站 UID**（纯数字 `12345678`、`UID:12345678`、`UID = 12345678`，
-   或直接粘贴 `https://space.bilibili.com/12345678`，四种写法都认），可加备注；
+   或直接粘贴 `https://space.bilibili.com/12345678`，四种写法都认；**1~15 位数字都支持**，长 UID 不会被截断，超长（16 位以上）的数字不会被当成 UID），可加备注；
 2. 站点调用 B站 公开接口核验（不需要登录 Cookie）：账号真实存在 → 等级 ≥ 下限 → 粉丝 ≥ 下限 → 昵称含关键词 → UID 未被别的 QQ 用过；
 3. 三态结果：
    - **通过**：网页直接显示**大号验证码 + 一键复制 + 有效期**，提示把码发给群里的机器人；
@@ -203,11 +203,35 @@ Windows 上可以用 `pythonw.exe review-site/serve.py --host 0.0.0.0` 配合任
 ## 自检
 
 ```bash
-python selftest_review_site.py     # 151 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
+python selftest_review_site.py     # 159 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
 node   selftest_review_site_ui.mjs # 74 项：纯函数边界、模板契约、渲染模拟、脚本语法
 ```
 
 两个自检都**离线**：B站 接口被替换成假实现，自检自己起一个真实 HTTP 服务并真发请求。
+
+## 网站打不开？按这个顺序查
+
+在**运行 AstrBot 的那台机器**上跑仓库自带的诊断脚本，它会逐项给结论：
+
+```bash
+python tools/diagnose_site.py                     # 自动找 AstrBot 目录
+python tools/diagnose_site.py --astrbot /opt/AstrBot --remote   # 从别的机器访问时加 --remote
+```
+
+（不在仓库里也没关系：这个脚本只用标准库，单独拷过去就能跑。）
+
+手工排查的话，按出现频率：
+
+| 现象 | 原因 | 处理 |
+| --- | --- | --- |
+| `/审核 网站` 说"未启用" | `web_site_enabled` 还是 `false`（默认就是关的），或插件版本 ≤ v1.1.6（那时没有内置站点） | 打开开关并重载插件；老版本请升级 |
+| 只有本机能开，手机/别的电脑打不开 | `web_site_host = 127.0.0.1`（默认），只监听本机 | 改成 `0.0.0.0`，**并在防火墙放行端口**（Windows: `New-NetFirewallRule -Direction Inbound -Protocol TCP -LocalPort 8787 -Action Allow`；Linux: `ufw allow 8787/tcp`） |
+| 浏览器"拒绝连接" | 端口上没人监听：插件没加载、开关没开、或站点启动失败 | 看 AstrBot 日志里 `内置审核网站已启动` / `内置审核网站启动失败`；后者通常是端口被占用，改 `web_site_port` |
+| 打开了却是别的页面 | 记错了端口：审核网站是**独立端口**（默认 8787），不是 AstrBot 控制台端口 | 申请页 `http://IP:8787/`，后台 `http://IP:8787/admin` |
+| 端口有人在听但页面报错 | 那个端口被别的程序占了 | 换 `web_site_port` |
+| 改了密码却登不上 | 旧版本缓存了密码哈希（v1.1.8 已修） | 升级到 v1.1.8+，或重启插件 |
+
+卡片里最快的一步：在机器人那台机器上访问 `http://127.0.0.1:8787/healthz`，返回 `{"ok": true, "version": ...}` 就说明站点本身没问题，问题在"怎么访问"（host/防火墙/IP）。
 
 ## 常见问题
 

@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.7",
+            version="v1.1.8",
             desc="自检用元数据",
         )
 
@@ -1708,6 +1708,10 @@ async def main():
         check(extract("UID = 998877") == "998877", "抽取等号写法")
         check(extract("我不知道") is None, "没有数字时返回 None")
         check(extract("我有 3 个号") is None, "1 位数字不算 UID（避免误判）")
+        check(extract("12345678901") == "12345678901", "11 位 UID 也能识别")
+        check(extract("123456789012345") == "123456789012345", "15 位 UID 也能识别")
+        check(extract("UID:1234567890123456") is None, "16 位数字不被当成 UID（不做截断）")
+        check(extract("https://space.bilibili.com/12345678901") == "12345678901", "链接里的长 UID 也能识别")
 
         # 2) 假 HTTP：按 UID 配响应（列表=按顺序消费，最后一条可重复用）
         http_calls = []
@@ -2117,7 +2121,7 @@ async def main():
             import threading  # noqa: E402
             import urllib.request  # noqa: E402
 
-            e2e_dir = PLUGIN_MAIN.parent.parent / ".selftest_data" / "e2e"
+            e2e_dir = Path(__file__).resolve().parent / ".selftest_data" / "e2e"
             shutil.rmtree(e2e_dir, ignore_errors=True)
             e2e_dir.mkdir(parents=True, exist_ok=True)
             site_store = SiteStore(e2e_dir / "e2e.db")

@@ -30,8 +30,9 @@ export const NOTE_MAX = 200;
 export const QQ_MIN_LEN = 5;
 export const QQ_MAX_LEN = 12;
 /** B站 UID 长度范围（1 位数字视为不合法）。 */
-export const UID_MIN_LEN = 2;
-export const UID_MAX_LEN = 10;
+export const UID_MIN_LEN = 2;        // 纯数字：至少 2 位，避免把「我有 3 个号」当成 UID
+export const UID_MIN_LEN_EXPLICIT = 1; // 明确写了 UID: / 主页链接：1 位也认（B站存在 mid=2 这种老账号）
+export const UID_MAX_LEN = 15;       // B站 mid 是 64 位整数，11~15 位接口都接受，上限给足不挡真人
 /** 后端固定 page size。 */
 export const DEFAULT_PAGE_SIZE = 50;
 
@@ -77,10 +78,10 @@ function digitsOnly(value) {
 }
 
 /** 校验 UID 数字串长度（1 位视为不合法），合法则原样返回，否则 null。 */
-function normalizeUidDigits(raw) {
+function normalizeUidDigits(raw, minLen = UID_MIN_LEN) {
   const s = digitsOnly(raw);
   if (!s) return null;
-  if (s.length < UID_MIN_LEN || s.length > UID_MAX_LEN) return null;
+  if (s.length < minLen || s.length > UID_MAX_LEN) return null;
   if (/^0+$/.test(s)) return null;
   return s;
 }
@@ -93,7 +94,9 @@ function normalizeUidDigits(raw) {
  * 从纯数字或 B站主页链接里抽出 UID 字符串。
  * 支持：`12345678`、`UID:12345678`、`uid=998877`、
  *       `https://space.bilibili.com/12345678`、`space.bilibili.com/12345678?from=x`。
- * 不合法（空、含非数字、1 位、超过 10 位）一律返回 null。
+ * 不合法（空、含非数字、1 位、超过 15 位）一律返回 null。
+ * 说明：B站 mid 是 64 位整数，实测 11~15 位接口都接受，所以上限放宽到 15 位；
+ * 填错的 UID 会由站点核验返回"不存在"，不会被误放行。
  */
 export function extractUid(text) {
   if (text === null || text === undefined) return null;
@@ -101,7 +104,7 @@ export function extractUid(text) {
   if (!raw) return null;
 
   // 纯数字直接判定
-  if (/^\d+$/.test(raw)) return normalizeUidDigits(raw);
+  if (/^\d+$/.test(raw)) return normalizeUidDigits(raw, UID_MIN_LEN);
 
   const lower = raw.toLowerCase();
   let match = lower.match(/space\.bilibili\.com\/(\d+)/);
@@ -109,7 +112,7 @@ export function extractUid(text) {
   if (!match) match = lower.match(/\buid\s*[=:：]\s*(\d+)/);
   if (!match) match = lower.match(/[?&]uid=(\d+)/);
   if (!match) return null;
-  return normalizeUidDigits(match[1]);
+  return normalizeUidDigits(match[1], UID_MIN_LEN_EXPLICIT);
 }
 
 /**

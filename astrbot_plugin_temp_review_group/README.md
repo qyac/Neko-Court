@@ -140,7 +140,7 @@
 开启 `bili_uid_enabled` 后，入群提问的「答案」就是成员的 B站 UID：
 
 1. 机器人提问（并自动附上 `bili_uid_prompt` 提示，例如「请把你的 B站 UID 发给我」）；
-2. 成员发来 UID——支持纯数字 `12345678`、`UID:12345678`、`UID = 12345678`，或直接发 `https://space.bilibili.com/12345678`；
+2. 成员发来 UID——支持纯数字 `12345678`、`UID:12345678`、`UID = 12345678`，或直接发 `https://space.bilibili.com/12345678`；**1~15 位数字都认**（B站 mid 是 64 位整数，长 UID 不会被截断成前几位）；
 3. 插件调用 B站公开接口 `x/web-interface/card` 核验账号（带正常 UA/Referer，结果缓存 10 分钟）；
 4. 按配置校验：账号真实存在 → 等级 ≥ `bili_uid_min_level` → 粉丝 ≥ `bili_uid_min_fans` → 昵称含 `bili_uid_name_keywords` 之一 → 该 UID 没有被别的 QQ 用过（`bili_uid_unique`）；
 5. 全部满足才算通过，照常下发验证码；不满足按答错计次，并在提示里**写明原因**（例如「B站 UID 审核·该 UID 在 B站不存在」）。
@@ -226,6 +226,8 @@
 | --- | --- | --- |
 | **内置（推荐）** | 插件配置里打开 `web_site_enabled`（可调 `web_site_host` / `web_site_port` / `web_site_trust_proxy`） | 只想装一个插件就有网站；插件启动时自己在后台起站点，**不用填 url/token**，验证码/规则自动同步 |
 | **独立部署** | 打开 `web_review_enabled` 并填 `web_review_url` + `web_review_token` | 想把站点放在另一台机器/另一套反代后面；用 `review-site/serve.py` 或站点 zip 单独跑 |
+
+打不开网页时，在运行 AstrBot 的机器上跑 `python tools/diagnose_site.py --remote` 会逐项告诉你卡在哪（开关没开 / 只监听 127.0.0.1 / 防火墙 / 端口被占 / 版本过旧）。
 
 QQ 里的管理指令：`/审核 网站`（状态）、`/审核 网站 同步`（立刻同步）、`/审核 网站 地址`（可分享链接）、
 `/审核 网站 token`（改用独立部署时要的密钥）、`/审核 网站 密码 <新密码>`（改站点后台密码）。

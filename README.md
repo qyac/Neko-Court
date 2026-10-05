@@ -6,7 +6,7 @@ AstrBot 插件项目。目前包含一个专门用于管理**临时审核群**�
 
 | 插件 | 版本 | 说明 |
 | --- | --- | --- |
-| [astrbot_plugin_temp_review_group](astrbot_plugin_temp_review_group/README.md) | v1.1.7 | 临时审核群管理：每日定时清理普通成员、新人入群自动提问、答错 N 次踢出、答对私聊下发当日验证码；判定可选规则或大模型；验证码每日轮换，支持管理员查询/设定/重置/补发 |
+| [astrbot_plugin_temp_review_group](astrbot_plugin_temp_review_group/README.md) | v1.1.8 | 临时审核群管理：每日定时清理普通成员、新人入群自动提问、答错 N 次踢出、答对私聊下发当日验证码；判定可选规则或大模型；验证码每日轮换，支持管理员查询/设定/重置/补发 |
 
 `astrbot_plugin_temp_review_group` 的能力：
 
@@ -48,11 +48,13 @@ Neko-Court/
 ├─ selftest_temp_review_group.py       # 插件后端自检（桩替 astrbot.*，462 项断言）
 ├─ selftest_settings_page.mjs          # 设置页自检（Node，12 项断言）
 ├─ selftest_questions_page.mjs         # 题库页自检（Node，10 项断言）
-├─ selftest_review_site.py             # 审核网站后端自检（151 项断言，含安全回归）
+├─ selftest_review_site.py             # 审核网站后端自检（159 项，含安全回归与诊断脚本）
 ├─ selftest_review_site_ui.mjs         # 审核网站前端自检（Node，74 项断言）
 ├─ review-site/serve.py                # 站点独立部署的启动器（实现就是插件里的 review_web/）
 ├─ tools/package_plugin.py             # 插件打包脚本：排除缓存、固定时间戳、产物自检
 ├─ tools/package_site.py               # 站点打包脚本（同样固定时间戳、产物自检）
+├─ tools/verify_artifacts.py           # 发布前校验：提交 = 工作区 = 产物，包内无 CRLF
+├─ tools/diagnose_site.py              # 「网站打不开」诊断（可在跑 AstrBot 的机器上单独跑）
 └─ dist/                               # 打包产物（已 gitignore，见 Release）
 ```
 
@@ -86,7 +88,7 @@ TEMP_REVIEW_PLUGIN_DIR=/path/to/extracted/astrbot_plugin_temp_review_group node 
 
 ## 发布
 
-约定：`metadata.yaml` 的 `version` = git 标签名 = 产物文件名里的版本号（当前都是 `v1.1.7`）。
+约定：`metadata.yaml` 的 `version` = git 标签名 = 产物文件名里的版本号（当前都是 `v1.1.8`）。
 
 ```powershell
 # 1) 推送（Git Credential Manager 会弹一次浏览器登录）
@@ -94,15 +96,15 @@ git push -u origin main --tags
 
 # 2) 建 Release + 上传产物，两种方式任选
 #    方式一：Web UI
-#      https://github.com/qyac/Neko-Court/releases/new?tag=v1.1.7
-#      标题：astrbot_plugin_temp_review_group v1.1.7
-#      说明：粘贴 dist/RELEASE_NOTES-v1.1.7.md
-#      附件：dist/astrbot_plugin_temp_review_group-v1.1.7.zip
+#      https://github.com/qyac/Neko-Court/releases/new?tag=v1.1.8
+#      标题：astrbot_plugin_temp_review_group v1.1.8
+#      说明：粘贴 dist/RELEASE_NOTES-v1.1.8.md
+#      附件：dist/astrbot_plugin_temp_review_group-v1.1.8.zip
 #    方式二：脚本（需要一个 Contents 读写权限的 token，仅从环境变量读取，不落盘、不回显）
 $env:GITHUB_TOKEN = "<PAT>"
-python tools/create_release.py --tag v1.1.7 `
-  --notes-file dist/RELEASE_NOTES-v1.1.7.md `
-  --asset dist/astrbot_plugin_temp_review_group-v1.1.7.zip
+python tools/create_release.py --tag v1.1.8 `
+  --notes-file dist/RELEASE_NOTES-v1.1.8.md `
+  --asset dist/astrbot_plugin_temp_review_group-v1.1.8.zip
 ```
 
 `tools/create_release.py` 支持 `--dry-run`（只打印计划）、`--draft`、`--prerelease`、
@@ -111,7 +113,7 @@ python tools/create_release.py --tag v1.1.7 `
 
 ## 版本
 
-当前：**v1.1.7**（与 `astrbot_plugin_temp_review_group/metadata.yaml` 的 `version` 一致，打包文件名也取自它）。
+当前：**v1.1.8**（与 `astrbot_plugin_temp_review_group/metadata.yaml` 的 `version` 一致，打包文件名也取自它）。
 
 ## 许可
 

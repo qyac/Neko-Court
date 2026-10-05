@@ -27,9 +27,12 @@ CACHE_TTL = 600.0
 CACHE_MAX = 5000  # 缓存条目上限，防止被大量不同 UID 刷爆内存
 RETRY_DELAY = 1.0
 
-_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})(?!\d)", re.I)
-_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})(?!\d)")
-_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,10})(?!\d)")
+UID_MIN_DIGITS = 1
+# B站 mid 是 64 位整数，11~15 位接口都接受；上限给足以免挡住真实用户
+UID_MAX_DIGITS = 15
+_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,15})(?!\d)", re.I)
+_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,15})(?!\d)")
+_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,15})(?!\d)")
 
 _cache: dict[str, tuple[float, dict[str, Any]]] = {}
 
@@ -41,7 +44,7 @@ def extract_uid(text: str) -> str | None:
         match = pattern.search(raw)
         if match:
             uid = match.group(1).lstrip("0")
-            if uid.isdigit() and 1 <= len(uid) <= 10:
+            if uid.isdigit() and UID_MIN_DIGITS <= len(uid) <= UID_MAX_DIGITS:
                 return uid
     return None
 

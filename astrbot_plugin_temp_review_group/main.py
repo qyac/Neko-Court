@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.7"
+PLUGIN_VERSION = "v1.1.8"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -117,9 +117,15 @@ WEB_REVIEW_TIMEOUT = 15.0
 # 内置站点绑定端口的重试次数与间隔（Windows 上端口刚释放时容易失败）
 WEB_SITE_BIND_ATTEMPTS = 5
 WEB_SITE_BIND_DELAY = 0.5
-_BILI_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})(?!\d)", re.I)
-_BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})(?!\d)")
-_BILI_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,10})(?!\d)")
+BILI_UID_MIN_DIGITS = 1
+# B站 mid 是 64 位整数，实测 11~15 位接口都正常接受（只是查不到就返回 -404），
+# 所以这里给足上限：真实用户不会被"位数不够/超了"挡在门外；填错由 B站 返回不存在。
+BILI_UID_MAX_DIGITS = 15
+_BILI_UID_IN_URL_RE = re.compile(
+    r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,15})(?!\d)", re.I
+)
+_BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,15})(?!\d)")
+_BILI_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,15})(?!\d)")
 # LLM 审核：系统提示词固定，要求模型只回一个判定词
 LLM_JUDGE_SYSTEM_PROMPT = (
     "你是入群审核判定器。根据审核问题、参考答案和申请人的回答，判断申请人是否通过。"
@@ -3233,7 +3239,7 @@ class TempReviewGroup(Star):
             match = pattern.search(raw)
             if match:
                 uid = match.group(1).lstrip("0")
-                if uid.isdigit() and 1 <= len(uid) <= 10:
+                if uid.isdigit() and BILI_UID_MIN_DIGITS <= len(uid) <= BILI_UID_MAX_DIGITS:
                     return uid
         return None
 

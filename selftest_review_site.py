@@ -239,7 +239,11 @@ def main() -> int:
         status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345679", "uid": "12345678", "note": "x" * 201})
         check(status == 400 and "备注" in data["error"], "备注超长被拒")
         status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345679", "uid": "  UID：12345678901 "})
-        check(status == 400, "11 位数字不算 UID")
+        check(status == 200, f"11 位 UID 可以正常提交（{status}）")
+        status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345671", "uid": "123456789012345"})
+        check(status == 200, f"15 位 UID 可以正常提交（{status}）")
+        status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345672", "uid": "1234567890123456"})
+        check(status == 400 and "UID" in data.get("error", ""), "16 位数字不被当成 UID（不做截断）")
         # 限流：每 QQ 3 次 / 10 分钟（前面的 12345678 已用掉 2 次）
         status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345678", "uid": "12345678"})
         check(status in (400, 429), f"触发限流或重复提交保护（{status}）")
@@ -627,6 +631,57 @@ def main() -> int:
         server.app.sessions["stale-token"] = {"csrf": "x", "created": time.time() - app_module.SESSION_TTL - 10, "ip": "1.1.1.1"}
         check(server.app.get_session("stale-token") is None, "过期会话取不到")
         check("stale-token" not in server.app.sessions, "过期会话被清出内存")
+
+        print("\n[8] 诊断脚本（tools/diagnose_site.py）")
+        import subprocess  # noqa: E402
+
+        diag_tool = WORKSPACE / "tools" / "diagnose_site.py"
+        check(diag_tool.is_file(), "诊断脚本存在")
+        plugin_dir = WORKSPACE / "astrbot_plugin_temp_review_group"
+        fake_root = DATA_DIR / "fake-astrbot"
+        (fake_root / "data" / "config").mkdir(parents=True, exist_ok=True)
+        (fake_root / "data" / "plugin_data" / "astrbot_plugin_temp_review_group" / "review-web").mkdir(
+            parents=True, exist_ok=True
+        )
+        # 用软链把插件目录挂进去不跨平台，这里直接写一个 config 并让脚本显式指定 --plugin
+        config_path = fake_root / "data" / "config" / "astrbot_plugin_temp_review_group_config.json"
+        state_db = fake_root / "data" / "plugin_data" / "astrbot_plugin_temp_review_group" / "review-web" / "review-site.db"
+        state_db.write_bytes(b"placeholder")
+
+        def run_diag(config: dict, extra: list[str] | None = None) -> tuple[int, str]:
+            config_path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+            proc = subprocess.run(
+                [sys.executable, str(diag_tool), "--astrbot", str(fake_root), "--plugin", str(plugin_dir), *(extra or [])],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+            return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+        # 运行中的站点 + 开关打开 → 应判定链路正常
+        code, output = run_diag(
+            {"web_site_enabled": True, "web_site_host": "127.0.0.1", "web_site_port": port}
+        )
+        check("健康检查通过" in output, f"对运行中的站点判定健康（exit={code}）")
+        check(code == 0, f"链路正常时退出码为 0（{code}）")
+        check("只有这台机器能打开" in output or "只有这台机器" in output, "提示 127.0.0.1 只能本机访问")
+
+        # 开关关闭 → 应指出问题并给出动作
+        code, output = run_diag({"web_site_enabled": False, "web_site_port": port})
+        check(code == 1 and "web_site_enabled" in output, f"开关关闭时明确报错（exit={code}）")
+        check("内置站点开关是关的" in output, "指出开关是关的")
+
+        # 端口没人听 → 应指出端口问题
+        code, output = run_diag({"web_site_enabled": True, "web_site_host": "127.0.0.1", "web_site_port": port + 1})
+        check(
+            any(word in output for word in ("没有监听", "连接失败", "拒绝连接", "超时", "端口上")),
+            f"指出端口问题（exit={code}）",
+        )
+        # 从别的机器访问时，127.0.0.1 才是问题
+        code, output = run_diag({"web_site_enabled": True, "web_site_host": "127.0.0.1", "web_site_port": port}, ["--remote"])
+        check(code == 1 and "一定打不开" in output, f"--remote 时把 127.0.0.1 判为问题（exit={code}）")
 
         print("\n[8] 前端资源结构")
         for name in ("apply.html", "login.html", "admin.html"):

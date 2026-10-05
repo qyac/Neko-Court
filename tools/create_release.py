@@ -4,9 +4,9 @@
 
     # PowerShell
     $env:GITHUB_TOKEN = "<fine-grained PAT: Contents=Read/Write, 或 classic PAT: repo>"
-    python tools/create_release.py --tag v1.1.7 `
-        --notes-file dist/RELEASE_NOTES-v1.1.7.md `
-        --asset dist/astrbot_plugin_temp_review_group-v1.1.7.zip
+    python tools/create_release.py --tag v1.1.8 `
+        --notes-file dist/RELEASE_NOTES-v1.1.8.md `
+        --asset dist/astrbot_plugin_temp_review_group-v1.1.8.zip
 
     # 先看要做什么，不发请求
     python tools/create_release.py --dry-run
@@ -31,7 +31,7 @@ from pathlib import Path
 WORKSPACE = Path(__file__).resolve().parent.parent
 SITE_VERSION_FILE = WORKSPACE / "review-site" / "VERSION"
 DEFAULT_REPO = "qyac/Neko-Court"
-DEFAULT_TAG = "v1.1.7"
+DEFAULT_TAG = "v1.1.8"
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 USER_AGENT = "neko-court-release-script"

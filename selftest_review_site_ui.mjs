@@ -102,8 +102,11 @@ check("extractUid: 空串 → null", () => {
   assert.equal(F.extractUid("   "), null);
 });
 
-check("extractUid: 11 位数字 → null", () => {
-  assert.equal(F.extractUid("12345678901"), null);
+check("extractUid: 11/15 位数字仍算 UID，16 位不算", () => {
+  assert.equal(F.extractUid("12345678901"), "12345678901");
+  assert.equal(F.extractUid("123456789012345"), "123456789012345");
+  assert.equal(F.extractUid("1234567890123456"), null);
+  assert.equal(F.extractUid("https://space.bilibili.com/12345678901"), "12345678901");
 });
 
 check("extractUid: 1 位数字 → null", () => {
