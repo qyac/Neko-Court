@@ -4,9 +4,9 @@
 
     # PowerShell
     $env:GITHUB_TOKEN = "<fine-grained PAT: Contents=Read/Write, 或 classic PAT: repo>"
-    python tools/create_release.py --tag v1.1.4 `
-        --notes-file dist/RELEASE_NOTES-v1.1.4.md `
-        --asset dist/astrbot_plugin_temp_review_group-v1.1.4.zip
+    python tools/create_release.py --tag v1.1.5 `
+        --notes-file dist/RELEASE_NOTES-v1.1.5.md `
+        --asset dist/astrbot_plugin_temp_review_group-v1.1.5.zip
 
     # 先看要做什么，不发请求
     python tools/create_release.py --dry-run
@@ -30,7 +30,7 @@ from pathlib import Path
 
 WORKSPACE = Path(__file__).resolve().parent.parent
 DEFAULT_REPO = "qyac/Neko-Court"
-DEFAULT_TAG = "v1.1.4"
+DEFAULT_TAG = "v1.1.5"
 API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 USER_AGENT = "neko-court-release-script"
@@ -83,7 +83,13 @@ def main() -> int:
     parser.add_argument("--tag", default=DEFAULT_TAG, help=f"已推送到远端的标签，默认 {DEFAULT_TAG}")
     parser.add_argument("--name", default="", help="Release 标题，默认用标签名")
     parser.add_argument("--notes-file", type=Path, default=None, help="Release 说明的 Markdown 文件")
-    parser.add_argument("--asset", type=Path, default=None, help="要上传的产物文件")
+    parser.add_argument(
+        "--asset",
+        type=Path,
+        action="append",
+        default=None,
+        help="要上传的产物文件（可以重复传多个）",
+    )
     parser.add_argument("--token-env", default="GITHUB_TOKEN", help="存放 token 的环境变量名")
     parser.add_argument("--draft", action="store_true", help="创建为草稿")
     parser.add_argument("--prerelease", action="store_true", help="标记为预发布")
@@ -92,11 +98,12 @@ def main() -> int:
     args = parser.parse_args()
 
     notes_path = args.notes_file.resolve() if args.notes_file else None
-    asset_path = args.asset.resolve() if args.asset else None
+    asset_paths = [item.resolve() for item in (args.asset or [])]
     if notes_path and not notes_path.is_file():
         raise SystemExit(f"说明文件不存在：{notes_path}")
-    if asset_path and not asset_path.is_file():
-        raise SystemExit(f"产物文件不存在：{asset_path}")
+    for item in asset_paths:
+        if not item.is_file():
+            raise SystemExit(f"产物文件不存在：{item}")
 
     title = args.name or f"astrbot_plugin_temp_review_group {args.tag}"
     plan = [
@@ -104,10 +111,14 @@ def main() -> int:
         f"标签：{args.tag}（需已在远端）",
         f"标题：{title}",
         f"说明：{notes_path.name if notes_path else '（无）'}",
-        f"产物：{asset_path.name if asset_path else '（无）'}"
-        + (f"  {asset_path.stat().st_size} 字节" if asset_path else ""),
-        f"草稿：{args.draft} / 预发布：{args.prerelease} / 替换同名产物：{args.replace_asset}",
     ]
+    if asset_paths:
+        for index, item in enumerate(asset_paths):
+            prefix = "产物" if index == 0 else "    "
+            plan.append(f"{prefix}：{item.name}  {item.stat().st_size} 字节")
+    else:
+        plan.append("产物：（无）")
+    plan.append(f"草稿：{args.draft} / 预发布：{args.prerelease} / 替换同名产物：{args.replace_asset}")
     print("发布计划：")
     for line in plan:
         print(f"  · {line}")
@@ -171,34 +182,29 @@ def main() -> int:
         print(f"✓ 已创建 Release #{release['id']}")
     assert isinstance(release, dict)
 
-    # 3) 上传产物（同名先删，保证幂等）
-    if asset_path:
+    # 3) 上传产物（同名先删，保证幂等；支持多个产物）
+    if asset_paths:
         upload_url = release.get("upload_url", "").split("{")[0]
         if not upload_url:
             raise SystemExit("Release 响应里没有 upload_url，无法上传产物。")
-        assets = release.get("assets") or []
-        for item in assets:
-            if item.get("name") == asset_path.name:
+        existing = {item.get("name"): item for item in (release.get("assets") or [])}
+        for asset_path in asset_paths:
+            old = existing.get(asset_path.name)
+            if old is not None:
                 if not args.replace_asset:
-                    raise SystemExit(
-                        f"同名产物已存在：{asset_path.name}（加 --replace-asset 覆盖）",
-                    )
-                api_request(
-                    "DELETE",
-                    f"{API}/repos/{args.repo}/releases/assets/{item['id']}",
-                    token,
-                )
+                    raise SystemExit(f"同名产物已存在：{asset_path.name}（加 --replace-asset 覆盖）")
+                api_request("DELETE", f"{API}/repos/{args.repo}/releases/assets/{old['id']}", token)
                 print(f"✓ 已删除同名旧产物 {asset_path.name}")
-        query = urllib.parse.urlencode({"name": asset_path.name})
-        status, asset = api_request(
-            "POST",
-            f"{upload_url}?{query}",
-            token,
-            body=asset_path.read_bytes(),
-            content_type="application/zip",
-        )
-        assert isinstance(asset, dict)
-        print(f"✓ 已上传产物 {asset.get('name')}（{asset.get('size')} 字节）")
+            query = urllib.parse.urlencode({"name": asset_path.name})
+            status, asset = api_request(
+                "POST",
+                f"{upload_url}?{query}",
+                token,
+                body=asset_path.read_bytes(),
+                content_type="application/zip",
+            )
+            assert isinstance(asset, dict)
+            print(f"✓ 已上传产物 {asset.get('name')}（{asset.get('size')} 字节）")
 
     print(f"\nRelease 页面：{release.get('html_url')}")
     return 0

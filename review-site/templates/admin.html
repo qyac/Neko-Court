@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<meta name="csrf" content="$csrf">
+<title>$site_name · 管理后台</title>
+<link rel="stylesheet" href="./static/style.css">
+</head>
+<body class="page page-admin">
+<a class="skip-link" href="#applications">跳到申请列表</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <div class="row-between">
+      <div>
+        <h1 class="site-name">$site_name</h1>
+        <p class="site-subtitle">临时审核群 · 管理后台</p>
+      </div>
+      <div class="btn-row">
+        <a class="btn btn-small" href="./">申请页</a>
+        <a class="btn btn-small" href="$logout_url">退出登录</a>
+      </div>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="alert-bar" class="alert alert-error" role="alert" hidden></div>
+
+  <section class="card" aria-labelledby="plugin-title">
+    <h2 class="card-title" id="plugin-title">插件连接状态</h2>
+    <div id="plugin-status">$plugin_status_html</div>
+  </section>
+
+  <section class="card" aria-labelledby="stats-title">
+    <h2 class="card-title" id="stats-title">申请统计</h2>
+    <div id="stats">$stats_html</div>
+  </section>
+
+  <section class="card" aria-labelledby="list-title">
+    <h2 class="card-title" id="list-title">申请队列</h2>
+
+    <div class="toolbar">
+      <div class="filter-grid">
+        <div class="field">
+          <label for="search-input">搜索（QQ / UID / 昵称）</label>
+          <input id="search-input" type="search" inputmode="search" autocomplete="off"
+                 placeholder="输入关键词，自动搜索" aria-describedby="search-hint">
+          <p class="hint" id="search-hint">输入后自动搜索，无需按回车。</p>
+        </div>
+        <div class="field">
+          <label for="status-filter">状态筛选</label>
+          <select id="status-filter">
+            <option value="all">全部</option>
+            <option value="pending">待审核</option>
+            <option value="approved">已通过</option>
+            <option value="rejected">已拒绝</option>
+            <option value="manual">待人工</option>
+            <option value="blocked">已拉黑</option>
+          </select>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button type="button" id="refresh-btn" class="btn btn-small">刷新列表</button>
+        <a class="btn btn-small" id="export-link" href="./api/admin/export.csv" download>导出 CSV</a>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table class="applications" id="applications-table">
+        <caption>申请记录（每页 50 条，按提交时间倒序）</caption>
+        <thead>
+          <tr>
+            <th scope="col">时间</th>
+            <th scope="col">QQ</th>
+            <th scope="col">B站 UID</th>
+            <th scope="col">B站昵称</th>
+            <th scope="col">等级 / 粉丝</th>
+            <th scope="col">状态</th>
+            <th scope="col">验证码</th>
+            <th scope="col">备注</th>
+            <th scope="col">操作</th>
+          </tr>
+        </thead>
+        <tbody id="applications-body"></tbody>
+      </table>
+    </div>
+
+    <div class="pager">
+      <span class="pager-info" id="pager-info" role="status">第 0-0 条，共 0 条</span>
+      <span class="btn-row">
+        <button type="button" id="prev-page" class="btn btn-small">上一页</button>
+        <button type="button" id="next-page" class="btn btn-small">下一页</button>
+      </span>
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="settings-title">
+    <h2 class="card-title" id="settings-title">站点设置</h2>
+    <form id="settings-form" novalidate>
+      <fieldset>
+        <legend>站点信息</legend>
+        <div class="settings-grid">
+          <div class="field">
+            <label for="site_name">站点名称</label>
+            <input id="site_name" name="site_name" type="text" autocomplete="off">
+            <p class="field-error" id="site_name-error" role="alert"></p>
+          </div>
+          <div class="field">
+            <label for="group_line">群信息行</label>
+            <input id="group_line" name="group_line" type="text" autocomplete="off"
+                   placeholder="例如：QQ 群 123456789">
+            <p class="hint">显示在申请页顶部，留空则不显示。</p>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>B站核验规则</legend>
+        <div class="settings-grid">
+          <div class="field">
+            <label for="bili_min_level">最低等级</label>
+            <input id="bili_min_level" name="bili_min_level" type="number" min="0" max="6" step="1" inputmode="numeric">
+          </div>
+          <div class="field">
+            <label for="bili_min_fans">最低粉丝数</label>
+            <input id="bili_min_fans" name="bili_min_fans" type="number" min="0" step="1" inputmode="numeric">
+          </div>
+          <div class="field span-2">
+            <label for="bili_name_keywords">昵称关键词（逗号分隔）</label>
+            <input id="bili_name_keywords" name="bili_name_keywords" type="text" autocomplete="off"
+                   placeholder="例如：猫, 猫猫">
+            <p class="hint">昵称包含任一关键词即视为通过关键词检查；留空表示不检查。</p>
+          </div>
+          <div class="field">
+            <label for="bili_on_error">核验接口异常时</label>
+            <select id="bili_on_error" name="bili_on_error">
+              <option value="manual">转人工审核</option>
+              <option value="reject">直接拒绝</option>
+              <option value="pass">直接通过</option>
+            </select>
+          </div>
+          <div class="field">
+            <span class="section-title" id="unique-label">唯一性</span>
+            <div class="checkbox">
+              <input id="bili_unique" name="bili_unique" type="checkbox" aria-describedby="bili_unique-hint">
+              <label for="bili_unique">同一 UID 只允许一个 QQ 使用</label>
+            </div>
+            <p class="hint" id="bili_unique-hint">开启后，已被其他 QQ 使用过的 UID 会被拒绝。</p>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>插件联动</legend>
+        <div class="checkbox">
+          <input id="use_plugin_rules" name="use_plugin_rules" type="checkbox" aria-describedby="use_plugin_rules-hint">
+          <label for="use_plugin_rules">沿用插件内的审核规则</label>
+        </div>
+        <p class="hint" id="use_plugin_rules-hint">开启后，插件侧配置的规则会覆盖上面的 B站核验规则。</p>
+        <div class="settings-grid">
+          <div class="field">
+            <label for="plugin_url">plugin_url</label>
+            <input id="plugin_url" name="plugin_url" type="url" autocomplete="off" spellcheck="false"
+                   placeholder="插件服务地址">
+            <p class="field-error" id="plugin_url-error" role="alert"></p>
+          </div>
+          <div class="field">
+            <label for="plugin_token">plugin_token</label>
+            <input id="plugin_token" name="plugin_token" type="password" autocomplete="new-password"
+                   placeholder="留空表示不修改">
+            <p class="hint">出于安全考虑，后端不会回显已保存的 token；保存成功后此输入框会被清空（至少 16 位）。</p>
+          </div>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>管理员密码</legend>
+        <div class="settings-grid">
+          <div class="field span-2">
+            <label for="admin_password">新密码</label>
+            <input id="admin_password" name="admin_password" type="password" autocomplete="new-password"
+                   placeholder="留空表示不修改">
+            <p class="hint">至少 8 位；留空表示不修改，修改后请用新密码重新登录。</p>
+          </div>
+        </div>
+      </fieldset>
+
+      <div class="btn-row settings-actions">
+        <button type="submit" id="settings-submit" class="btn btn-primary">保存设置</button>
+        <button type="button" id="settings-reload" class="btn">重新载入</button>
+      </div>
+    </form>
+  </section>
+</main>
+
+<footer class="site-footer" id="site-footer">$footer_html</footer>
+<script type="application/json" id="initial-data">$initial_json</script>
+<script type="module" src="./static/app.js"></script>
+</body>
+</html>

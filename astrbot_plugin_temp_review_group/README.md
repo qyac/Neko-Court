@@ -35,6 +35,7 @@
 | `/审核 诊断` | 排查「新人入群没收到消息」：事件计数、配置核对、群内发送自检、B站 UID 审核状态 |
 | `/审核 查UID <UID>` | 查询某个 B站 UID：昵称、等级、粉丝、按当前规则是否通过、被哪个 QQ 绑定 |
 | `/审核 解绑 <UID>` | 清除 UID↔QQ 绑定（解除「一个 UID 只能绑一个 QQ」的限制） |
+| `/审核 网站 [同步]` | 查看网页审核对接状态（站点、最近同步、累计接收）；加 `同步` 立刻同步一次 |
 | `/审核 重置码` | 立即随机重新生成验证码（当天提前轮换） |
 | `/审核 设定码 <验证码>` | 手动指定当前验证码（与顶层指令等价） |
 | `/审核 放行 <QQ号> [群号]` | 手动放行并下发验证码（也支持 `@某人`） |
@@ -217,6 +218,21 @@
 
 兼容性：页面依赖 `astrbot.api.web`（AstrBot 4.10+ 均已提供）。若运行环境没有它，插件照常工作，只是两个页面不可用（日志会给出提示）。
 
+## 网页审核对接（可选，配套审核网站）
+
+插件可以和仓库里的 [审核网站](../review-site/README.md) 联动：申请人在网页上填 QQ + B站 UID，
+核验通过后**网页直接显示当日验证码**；插件把网页通过的人接进来，他们入群时不再被提问。
+
+- **方向是插件主动出站**：插件定期把验证码、有效期、审核群、B站 规则、UID↔QQ 绑定推给站点
+  （`POST /api/plugin/sync`），再把站点上"已通过未通知"的记录拉走并 ack
+  （`GET /api/plugin/applications` → `POST /api/plugin/ack`）。站点**不需要**反向访问 AstrBot，
+  所以 AstrBot 在内网/NAT 后面也能用。
+- **两阶段投递**：拉取只读取，插件处理完再 ack；中途崩溃下一轮会重拉，写入是幂等的（不会重复放行）。
+- **免提问**：网页通过的人入群时，插件直接私发当日验证码（`web_review_auto_approve=true`，可关）。
+- **一份码**：验证码始终由插件生成与轮换，站点只是展示，两边不会出现两个码。
+- **配置**：`web_review_enabled` + `web_review_url` + `web_review_token`（token 在站点启动时打印），
+  同步间隔 `web_review_poll_seconds` 默认 30 秒。可用 `/审核 网站` 查看状态、`/审核 网站 同步` 立即同步。
+
 ## 工作流程
 
 ```
@@ -273,6 +289,11 @@
 | `bili_uid_unique` | bool | `true` | 一个 UID 只能绑一个 QQ（防一码多用） |
 | `bili_uid_on_error` | string | `reject` | 接口被风控/网络失败时：`reject` 判不通过 / `pass` 放行 |
 | `bili_uid_timeout_seconds` | float | `10` | B站接口单次超时（风控时会自动重试一次） |
+| `web_review_enabled` | bool | `false` | 启用与审核网站的对接 |
+| `web_review_url` | string | `""` | 审核网站地址（AstrBot 能访问到的），如 `http://127.0.0.1:8787` |
+| `web_review_token` | string（secret） | `""` | 站点启动时打印的共享 token；**不回显**，留空表示不修改 |
+| `web_review_poll_seconds` | int | `30` | 同步/拉取间隔（10~600 秒） |
+| `web_review_auto_approve` | bool | `true` | 网页通过者入群免提问，直接私发验证码 |
 | `code_send_mode` | string | `private` | `private` / `group` / `both`，见上文 |
 | `private_code_message` | text | 见配置页 | 私聊发码文案，占位符 `{code}` `{expire}` `{user}` `{group}` |
 | `code_fallback_to_group` | bool | `false` | 私聊失败时是否改为群内发码兜底 |
@@ -310,9 +331,9 @@
 
 ## 自检
 
-仓库根目录有三个自检脚本，都只用标准库、不依赖 AstrBot 本体：
+仓库根目录有五个自检脚本（插件后端 + 两个 Pages + 审核网站后端 + 审核网站前端），都只用标准库、不依赖 AstrBot 本体：
 
-1. `selftest_temp_review_group.py`（Python）用桩模块替换 `astrbot.*`，直接导入本插件的 `main.py`，覆盖答案匹配、验证码生成、时间解析、入群提问、答错踢出、答对发码、指令消息不误判、每日清理（含白名单与保留已通过）、状态持久化、权限判定、主动发送、查询/设定/重置验证码与放行/补发、重审、踢出、清理等全部管理指令，**LLM 审核**（PASS/FAIL 解析、否定词优先、超时/报错/无 Provider/提供商不存在时的规则回退、hybrid 省额度、提示词占位符），**发码渠道**（private/group/both、群临时会话 `send_private_msg`、auto/temp_session/friend 三种通道、临时会话失败退回好友、私聊失败回退群内、文案缺 `{code}` 自动补码），**排查能力**（群通知/入群/退群/非配置群/群消息事件计数、跳过原因、发送失败计数、重复入群重新提问、`/审核 诊断` 结论与群内发送自检），**问题库/答案库**（停用题目不参与抽题、单题匹配方式覆盖全局、fuzzy 相似度与阈值边界、通用答案库、题干快照进记录、该题提示自动附加、抽中/通过统计与不被每日清理清掉、`/审核 题库` 与 `/审核 试答` 的输出与"不改动记录"特性），以及 **WebUI 后端 API**（GET/POST 契约、类型与范围校验、各类拒绝路径、保存失败处理）和 Pages 资源结构，共 **377 项断言**：
+1. `selftest_temp_review_group.py`（Python）用桩模块替换 `astrbot.*`，直接导入本插件的 `main.py`，覆盖答案匹配、验证码生成、时间解析、入群提问、答错踢出、答对发码、指令消息不误判、每日清理（含白名单与保留已通过）、状态持久化、权限判定、主动发送、查询/设定/重置验证码与放行/补发、重审、踢出、清理等全部管理指令，**LLM 审核**（PASS/FAIL 解析、否定词优先、超时/报错/无 Provider/提供商不存在时的规则回退、hybrid 省额度、提示词占位符），**发码渠道**（private/group/both、群临时会话 `send_private_msg`、auto/temp_session/friend 三种通道、临时会话失败退回好友、私聊失败回退群内、文案缺 `{code}` 自动补码），**排查能力**（群通知/入群/退群/非配置群/群消息事件计数、跳过原因、发送失败计数、重复入群重新提问、`/审核 诊断` 结论与群内发送自检），**问题库/答案库**（停用题目不参与抽题、单题匹配方式覆盖全局、fuzzy 相似度与阈值边界、通用答案库、题干快照进记录、该题提示自动附加、抽中/通过统计与不被每日清理清掉、`/审核 题库` 与 `/审核 试答` 的输出与"不改动记录"特性），以及 **WebUI 后端 API**（GET/POST 契约、类型与范围校验、各类拒绝路径、保存失败处理）和 Pages 资源结构，共 **435 项断言**：
 
    ```bash
    python selftest_temp_review_group.py
@@ -330,7 +351,7 @@
    node selftest_questions_page.mjs
    ```
 
-这三个脚本都只是开发辅助，位于**开发仓库根目录**（不在插件目录内，因此不随插件包分发），可以随时删除，不影响插件运行。
+这些脚本都只是开发辅助，位于**开发仓库根目录**（不在插件目录内，因此不随插件包分发），可以随时删除，不影响插件运行。
 
 ## 打包与分发
 
@@ -354,7 +375,7 @@ astrbot_plugin_temp_review_group/
 1. **WebUI 安装**：把 zip 上传/或把仓库地址交给插件的安装入口（AstrBot 会把它放到 `data/plugins/<插件名>/`）；
 2. **手动安装**：解压后确认目录层级为 `AstrBot/data/plugins/astrbot_plugin_temp_review_group/main.py`，然后在 WebUI 插件管理里重载。
 
-校验打包产物：把 zip 解压到任意目录后，用环境变量指向它跑自检（三个脚本都支持）：
+校验打包产物：把 zip 解压到任意目录后，用环境变量指向它跑自检（插件后端与 Pages 脚本支持）：
 
 ```bash
 TEMP_REVIEW_PLUGIN_DIR=/path/to/extracted/astrbot_plugin_temp_review_group python selftest_temp_review_group.py

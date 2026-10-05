@@ -30,6 +30,8 @@ import re
 import secrets
 import time
 import unicodedata
+import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
@@ -56,7 +58,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.4"
+PLUGIN_VERSION = "v1.1.5"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -107,8 +109,11 @@ BILI_NOT_FOUND_CODES = {-400, -404, 62002}
 BILI_CACHE_TTL = 600.0
 # 被风控时的重试等待（自检里会调成 0）
 BILI_RETRY_DELAY = 1.0
-_BILI_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})", re.I)
-_BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})")
+# 网页审核对接：一次最多拉取多少条"网页已通过"记录
+WEB_REVIEW_PULL_LIMIT = 50
+WEB_REVIEW_TIMEOUT = 15.0
+_BILI_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})(?!\d)", re.I)
+_BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})(?!\d)")
 _BILI_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,10})(?!\d)")
 # LLM 审核：系统提示词固定，要求模型只回一个判定词
 LLM_JUDGE_SYSTEM_PROMPT = (
@@ -356,6 +361,8 @@ class TempReviewGroup(Star):
             return
         self._loops.append(asyncio.create_task(self._code_loop(), name="temp-review-code"))
         self._loops.append(asyncio.create_task(self._cleanup_loop(), name="temp-review-cleanup"))
+        if self._bool("web_review_enabled", False) and self._web_review_url():
+            self._loops.append(asyncio.create_task(self._web_review_loop(), name="temp-review-web"))
 
     def _spawn(self, coro: Any) -> None:
         """启动一次性后台任务（例如手动清理），并纳入 terminate 的统一清理。"""
@@ -912,6 +919,245 @@ class TempReviewGroup(Star):
             return  # 这是给某个指令的消息，交给指令处理
         await self._judge_answer(event, group_id, user_id, text)
 
+    # ------------------------------------------------------------------ 网页审核对接
+
+    def _web_review_url(self) -> str:
+        return str(self._get("web_review_url", "") or "").strip().rstrip("/")
+
+    def _web_review_token(self) -> str:
+        return str(self._get("web_review_token", "") or "").strip()
+
+    def _web_review_enabled(self) -> bool:
+        return self._bool("web_review_enabled", False) and bool(self._web_review_url()) and bool(self._web_review_token())
+
+    def _web_review_poll_seconds(self) -> int:
+        return self._int("web_review_poll_seconds", 30, minimum=5)
+
+    def _web_review_status(self) -> dict[str, Any]:
+        return dict(self._state.get("web_review") or {})
+
+    def _web_review_set(self, **fields: Any) -> None:
+        """更新同步状态（调用方一般已持锁，或可接受最终一致）。"""
+        record = self._state.setdefault("web_review", {})
+        record.update(fields)
+
+    async def _http_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
+        timeout: float = WEB_REVIEW_TIMEOUT,
+    ) -> Any:
+        """通用 JSON 请求：优先 aiohttp/httpx，都没有时退回线程里的 urllib（都不阻塞事件循环）。"""
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+        base_headers = {
+            "User-Agent": BILI_USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+        }
+        if body is not None:
+            base_headers["Content-Type"] = "application/json"
+        base_headers.update(headers or {})
+        try:
+            import aiohttp  # type: ignore
+
+            async with aiohttp.ClientSession(headers=base_headers) as session:
+                async with session.request(method, url, data=body, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                    text = await resp.text()
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}：{text[:200]}")
+                    return json.loads(text)
+        except ImportError:
+            pass
+        try:
+            import httpx  # type: ignore
+
+            async with httpx.AsyncClient(headers=base_headers, timeout=timeout) as client:
+                resp = await client.request(method, url, content=body)
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"HTTP {resp.status_code}：{resp.text[:200]}")
+                return json.loads(resp.text)
+        except ImportError:
+            pass
+
+        def _blocking() -> Any:
+            request = urllib.request.Request(url, data=body, headers=base_headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return json.loads(response.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:200]
+                raise RuntimeError(f"HTTP {exc.code}：{detail}") from exc
+
+        return await asyncio.to_thread(_blocking)
+
+    def _web_review_snapshot(self) -> dict[str, Any]:
+        """留给站点的快照：验证码、规则、绑定、统计。"""
+        bindings = {}
+        for uid, record in (self._state.get("bili_uids") or {}).items():
+            if isinstance(record, dict) and record.get("qq"):
+                bindings[str(uid)] = str(record["qq"])
+        stats = self._web_review_status()
+        return {
+            "token": self._web_review_token(),
+            "code": str(self._state.get("code") or ""),
+            "code_expire": self._expire_text(),
+            "groups": self._review_groups(),
+            "bili": {
+                "bili_enabled": self._bili_enabled(),
+                "bili_min_level": self._bili_min_level(),
+                "bili_min_fans": self._bili_min_fans(),
+                "bili_name_keywords": self._bili_name_keywords(),
+                "bili_unique": self._bool("bili_uid_unique", True),
+                "bili_on_error": self._bili_on_error(),
+            },
+            "bindings": dict(list(bindings.items())[:2000]),
+            "stats": {"pending": len(self._state.get("pending") or {}), "approved": len(self._state.get("approved") or {})},
+            "pulled": int(stats.get("pulled") or 0),
+        }
+
+    async def _web_review_sync(self) -> tuple[bool, str]:
+        """把当前的验证码/规则/绑定推给审核网站。"""
+        if not self._web_review_enabled():
+            return False, "未启用（web_review_enabled=false 或缺 url/token）"
+        url = f"{self._web_review_url()}/api/plugin/sync"
+        try:
+            data = await self._http_json("POST", url, payload=self._web_review_snapshot())
+        except Exception as exc:
+            return False, f"同步失败：{exc}"
+        if not isinstance(data, dict) or not data.get("ok"):
+            return False, f"同步被拒绝：{str(data)[:120]}"
+        async with self._lock:
+            self._web_review_set(last_sync_at=time.time(), last_error="", pending_deliveries=int(data.get("pending_deliveries") or 0))
+            self._save_state()
+        return True, f"已同步（网站待投递 {data.get('pending_deliveries', 0)} 条）"
+
+    async def _web_review_pull(self) -> tuple[int, str]:
+        """拉取"网页已通过"名单并写入本地 approved，然后 ack（幂等）。"""
+        if not self._web_review_enabled():
+            return 0, "未启用"
+        base = self._web_review_url()
+        token = urllib.parse.quote(self._web_review_token())
+        try:
+            data = await self._http_json(
+                "GET",
+                f"{base}/api/plugin/applications?status=approved&limit={WEB_REVIEW_PULL_LIMIT}&token={token}",
+            )
+        except Exception as exc:
+            return 0, f"拉取失败：{exc}"
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list) or not items:
+            async with self._lock:
+                self._web_review_set(last_pull_at=time.time(), last_error="")
+                self._save_state()
+            return 0, "没有新的网页通过记录"
+
+        groups = self._review_groups() or [""]
+        code = str(self._state.get("code") or "")
+        acked: list[int] = []
+        accepted = 0
+        async with self._lock:
+            now = time.time()
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                app_id = item.get("id")
+                user_id = str(item.get("qq") or "").strip()
+                if not user_id:
+                    continue
+                uid = str(item.get("uid") or "")
+                name = str(item.get("uid_name") or "")
+                for group_id in groups:
+                    key = self._key(group_id, user_id)
+                    self._state["approved"][key] = {
+                        "at": now,
+                        "code": code,
+                        "platform_id": "",
+                        "question": "网页审核",
+                        "bili_uid": uid,
+                        "bili_name": name,
+                        "source": "web",
+                    }
+                    self._state["pending"].pop(key, None)
+                if uid:
+                    self._bili_bind(uid, user_id, name, groups[0] if groups else "")
+                accepted += 1
+                if str(app_id).isdigit():
+                    acked.append(int(app_id))
+            record = self._state.setdefault("web_review", {})
+            record["last_pull_at"] = now
+            record["last_error"] = ""
+            record["pulled"] = int(record.get("pulled") or 0) + accepted
+            self._save_state()
+        if not acked:
+            return accepted, f"已接收 {accepted} 条（网站没给编号，未 ack）"
+        try:
+            await self._http_json(
+                "POST",
+                f"{base}/api/plugin/ack",
+                payload={"token": self._web_review_token(), "ids": acked},
+            )
+        except Exception as exc:
+            # 没 ack 成功不要紧：下一轮会重复拉到，写入是幂等的
+            return accepted, f"已接收 {accepted} 条，但 ack 失败（下轮会重试）：{exc}"
+        logger.info("[审核群] 已接收 %s 条网页审核通过记录（同步到 %s 个群）。", accepted, len(groups))
+        return accepted, f"已接收 {accepted} 条网页通过记录并 ack"
+
+    async def _web_review_once(self) -> tuple[bool, int, str]:
+        """跑一轮：先同步（把验证码/规则推上去），再拉取名单。"""
+        synced, sync_note = await self._web_review_sync()
+        pulled, pull_note = await self._web_review_pull()
+        if not synced:
+            async with self._lock:
+                self._web_review_set(last_error=sync_note, last_attempt_at=time.time())
+                self._save_state()
+        return synced, pulled, f"{sync_note}；{pull_note}"
+
+    async def _web_review_loop(self) -> None:
+        await asyncio.sleep(3.0)  # 等启动流程走完
+        while not self._stop.is_set():
+            interval = self._web_review_poll_seconds()
+            if self._web_review_enabled():
+                try:
+                    synced, pulled, note = await self._web_review_once()
+                    if not synced:
+                        logger.warning("[审核群] 网页审核同步失败：%s", note)
+                        self._diag_set_reason(f"网页审核同步失败：{note}")
+                    elif pulled:
+                        logger.info("[审核群] 网页审核：%s", note)
+                except Exception:
+                    logger.exception("[审核群] 网页审核后台任务异常")
+            await self._sleep(interval)
+
+    async def _handle_web_approved(self, event: AstrMessageEvent, group_id: str, user_id: str, record: dict[str, Any]) -> bool:
+        """已经在网页上通过审核的人入群：不再提问，直接把验证码私发给他。"""
+        if not self._bool("web_review_auto_approve", True):
+            return False
+        if str(record.get("source") or "") != "web":
+            return False
+        code = str(self._state.get("code") or record.get("code") or "")
+        try:
+            result = await self._deliver_code(
+                group_id=group_id,
+                user_id=user_id,
+                platform_id=str(event.get_platform_id() or record.get("platform_id") or ""),
+                code=code,
+                user_name=event.get_sender_name() or user_id,
+                event=event,
+            )
+        except Exception:
+            logger.exception("[审核群] 给网页已通过成员发码失败")
+            return False
+        logger.info(
+            "[审核群] 成员 %s 已在网页通过审核（B站 UID %s），入群后直接发码，未再提问。",
+            user_id,
+            record.get("bili_uid") or "未知",
+        )
+        self._diag_bump("web_approved")
+        self._diag_set_reason(f"成员 {user_id} 已在网页通过审核，直接发码")
+        return bool(result.get("private") or result.get("group_code"))
+
     async def _start_review(self, event: AstrMessageEvent, group_id: str, user_id: str) -> None:
         if user_id in self._self_ids():
             return
@@ -919,6 +1165,10 @@ class TempReviewGroup(Star):
             self._diag_bump("exempt")
             self._diag_set_reason(f"用户 {user_id} 在 admin_ids/exempt_user_ids 中，按配置跳过审核")
             logger.info("[审核群] %s 在管理员/免审核名单中，跳过审核。", user_id)
+            return
+        # 网页审核已通过的人：直接发码，不再提问
+        approved = (self._state.get("approved") or {}).get(self._key(group_id, user_id))
+        if isinstance(approved, dict) and await self._handle_web_approved(event, group_id, user_id, approved):
             return
         question = self._pick_question()
         if question is None:
@@ -1560,6 +1810,19 @@ class TempReviewGroup(Star):
         else:
             lines.append("B站 UID 审核：未启用（bili_uid_enabled=false）")
         lines.append("")
+        if self._bool("web_review_enabled", False):
+            status = self._web_review_status()
+            lines.append(
+                f"网页审核：✅ 已启用 ｜ {self._web_review_url() or '（未填 url）'} ｜ "
+                f"轮询 {self._web_review_poll_seconds()} 秒 ｜ 累计接收 {int(status.get('pulled') or 0)} 条"
+            )
+            if not status.get("last_sync_at"):
+                lines.append("· 还没成功同步过：检查 web_review_url / web_review_token，或网络是否可达")
+            elif status.get("last_error"):
+                lines.append(f"· 最近错误：{status['last_error']}")
+        else:
+            lines.append("网页审核：未启用（web_review_enabled=false）")
+        lines.append("")
         lines.append("结论：" + self._diag_verdict(counters))
 
         target = current_group if current_group in groups else (groups[0] if groups else "")
@@ -1887,6 +2150,45 @@ class TempReviewGroup(Star):
             f"✅ 已解绑 UID {uid_text}（原绑定：QQ {record.get('qq')}"
             f"{'，昵称 ' + str(record.get('name')) if record.get('name') else ''}）"
         )
+
+    @review_cmd.command("网站")
+    async def review_website(self, event: AstrMessageEvent, action: str = ""):
+        """查看/手动同步审核网站：/审核 网站 [同步]"""
+        if not await self._check_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以查看网页审核对接状态。")
+            return
+        if not self._bool("web_review_enabled", False):
+            yield event.plain_result(
+                "🌐 网页审核对接未启用。\n"
+                "在插件配置里打开 web_review_enabled，并填好 web_review_url 与 web_review_token"
+                "（token 在审核网站启动时打印）。"
+            )
+            return
+        if not self._web_review_url() or not self._web_review_token():
+            yield event.plain_result("⚠️ 已启用网页审核，但 web_review_url 或 web_review_token 没填。")
+            return
+        if action.strip() in {"同步", "sync", "拉取"}:
+            yield event.plain_result("🔄 正在同步（推送验证码/规则，并拉取网页已通过名单）…")
+            synced, pulled, note = await self._web_review_once()
+            yield event.plain_result(("✅ " if synced else "❌ ") + note)
+            return
+        status = self._web_review_status()
+        last_sync = float(status.get("last_sync_at") or 0)
+        last_pull = float(status.get("last_pull_at") or 0)
+        lines = [
+            "🌐 网页审核对接",
+            f"站点：{self._web_review_url()}",
+            f"轮询间隔：{self._web_review_poll_seconds()} 秒 ｜ 自动发码：{'开' if self._bool('web_review_auto_approve', True) else '关'}",
+            f"最近同步：{self._fmt_ts(last_sync) if last_sync else '尚未成功同步'}"
+            + (f"（{self._humanize(time.time() - last_sync)}前）" if last_sync else ""),
+            f"最近拉取：{self._fmt_ts(last_pull) if last_pull else '尚未拉取'}"
+            f" ｜ 累计接收 {int(status.get('pulled') or 0)} 条",
+            f"网站端待投递：{int(status.get('pending_deliveries') or 0)} 条",
+        ]
+        if status.get("last_error"):
+            lines.append(f"⚠️ 最近错误：{status['last_error']}")
+        lines.append("提示：/审核 网站 同步 可以立刻同步一次。")
+        yield event.plain_result("\n".join(lines))
 
     @review_cmd.command("清理")
     async def review_cleanup(self, event: AstrMessageEvent, group: str = ""):

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<title>$site_name · 入群申请</title>
+<link rel="stylesheet" href="./static/style.css">
+</head>
+<body class="page page-apply">
+<a class="skip-link" href="#main">跳到表单</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <h1 class="site-name">$site_name</h1>
+    <p class="site-subtitle">$site_subtitle</p>
+    <p class="meta-line" id="group-line">$group_line</p>
+    <p class="meta-line" id="rules-line">$rules_line</p>
+    <ol class="steps">
+      <li>填写你的 QQ 号与 B站 UID（可直接粘贴主页链接）。</li>
+      <li>站点自动核验 B站等级、粉丝与昵称关键词。</li>
+      <li>通过后把页面上显示的当日验证码发给群机器人或管理员即可入群。</li>
+    </ol>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+  <div id="alert-bar" class="alert alert-error" role="alert" hidden></div>
+
+  <section class="card notice-slot" id="notice-slot" aria-label="站点提示">$notice_html</section>
+
+  <form id="apply-form" class="card" novalidate>
+    <h2 class="card-title">填写入群申请</h2>
+
+    <div class="field">
+      <label for="qq">QQ 号 <span class="req" aria-hidden="true">*</span></label>
+      <input id="qq" name="qq" type="text" inputmode="numeric" autocomplete="off"
+             enterkeyhint="next" required placeholder="5~12 位数字"
+             aria-describedby="qq-error">
+      <p class="field-error" id="qq-error" role="alert"></p>
+    </div>
+
+    <div class="field">
+      <label for="uid">B站 UID 或主页链接 <span class="req" aria-hidden="true">*</span></label>
+      <input id="uid" name="uid" type="text" inputmode="text" autocomplete="off"
+             enterkeyhint="next" required placeholder="例如 12345678 或 space.bilibili.com/12345678"
+             aria-describedby="uid-error">
+      <p class="field-error" id="uid-error" role="alert"></p>
+      <p class="hint">可复制 B站个人主页地址后直接粘贴，会自动识别其中的数字 UID。</p>
+    </div>
+
+    <div class="field">
+      <label for="note">备注（可选）</label>
+      <textarea id="note" name="note" maxlength="200" rows="3"
+                placeholder="想说明的情况，可留空"
+                aria-describedby="note-error note-count"></textarea>
+      <p class="field-error" id="note-error" role="alert"></p>
+      <p class="hint" id="note-count">0 / 200</p>
+    </div>
+
+    <button type="submit" id="apply-submit" class="btn btn-primary btn-block">提交申请</button>
+  </form>
+
+  <p class="progress" id="apply-progress" hidden><span class="spinner" aria-hidden="true"></span><span id="apply-progress-text">正在核验…</span></p>
+
+  <section class="result" id="apply-result" aria-live="polite" tabindex="-1" hidden></section>
+
+  <script type="application/json" id="initial-data">{}</script>
+</main>
+
+<footer class="site-footer" id="site-footer">$footer_html</footer>
+<script type="module" src="./static/app.js"></script>
+</body>
+</html>

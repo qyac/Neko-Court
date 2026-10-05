@@ -1,0 +1,179 @@
+# 临时审核群 · 审核网站
+
+一个可以独立运行的**入群审核网站**：申请人在网页上填 QQ + B站 UID，站点核验 B站 账号后**直接把当日验证码显示在网页上**；
+管理员在 `/admin` 看队列、手动通过/拒绝/拉黑、导出 CSV、改规则与站点设置。
+
+- **零第三方依赖**：只用 Python 标准库（`http.server` + `sqlite3` + `urllib`），不需要 Flask/Django/Node。
+- **站点永远不需要反向访问 AstrBot**：由插件主动出站同步与拉取（见下），所以 AstrBot 在内网/NAT/没有公网 IP 时也能用。
+
+## 它是怎么和 QQ 插件联动的
+
+```
+申请人 ──填表──▶ 审核网站（本程序，SQLite）
+                    ▲              │
+        插件主动出站 │              │ 插件主动出站
+        POST /api/plugin/sync      │ GET /api/plugin/applications → POST /api/plugin/ack
+                    │              ▼
+              AstrBot 插件（验证码/规则/UID 绑定的唯一权威）
+```
+
+1. **同步（插件 → 站点）**：插件每隔 `web_review_poll_seconds` 秒把当前**验证码**、有效期、审核群号、
+   B站 审核规则、UID↔QQ 绑定、待审核/已通过统计推给站点。站点因此能：
+   - 把验证码直接显示给通过的人；
+   - 用插件的那套规则做判定（`use_plugin_rules=true` 时）；
+   - 识别"这个 UID 已经被别的 QQ 用过"。
+2. **拉取（插件 → 站点）**：插件把站点上"已通过但还没通知插件"的记录拉走，写入自己的 `approved` 名单并记住 B站 UID，
+   然后 **ack** 告知站点（两阶段，插件半路崩了下一轮会重拉，写入是幂等的）。
+3. **入群免提问**：网页通过的人进群时，插件不再提问，直接私发当日验证码（`web_review_auto_approve=true`，可关）。
+
+站点侧只做**核验与展示**，验证码的生成与轮换始终在插件里，两边永远只有一份码。
+
+## 快速开始
+
+```bash
+# 1) 启动（首次会打印随机管理员密码与插件 token，只显示一次）
+python review-site/serve.py --host 0.0.0.0 --port 8787
+
+# 想自己指定：
+python review-site/serve.py --host 0.0.0.0 --port 8787 \
+  --admin-password '你的管理员密码（≥8位）' \
+  --plugin-token '至少16位的随机串'
+
+# 只看当前配置（含插件要填的两项）：
+python review-site/serve.py --print-config
+```
+
+启动后：
+
+- 申请页 `http://<地址>:8787/` —— 把这个链接发到群里/公告里；
+- 管理后台 `http://<地址>:8787/admin` —— 用管理员密码登录（首次登录后请改密码）；
+- 数据文件 `review-site/data/review-site.db`（SQLite，备份它即可）。
+
+然后在 **AstrBot 插件配置**里填两项（插件侧配置 → 网页审核对接）：
+
+| 配置 | 值 |
+| --- | --- |
+| `web_review_enabled` | 打开 |
+| `web_review_url` | 站点地址，例如 `http://127.0.0.1:8787`（AstrBot 能访问到的地址；同一台机器就用 127.0.0.1） |
+| `web_review_token` | 启动时打印的那串（也可以在后台"设置"里看到/重置：站点只用于校验，不再展示给申请人） |
+| `web_review_poll_seconds` | 同步间隔，默认 30 秒 |
+| `web_review_auto_approve` | 网页通过者入群免提问，默认开 |
+
+一个轮询周期内，QQ 里用 `/审核 网站` 就能看到"最近同步 / 累计接收 / 待投递"，`/审核 网站 同步` 可立刻同步一次。
+
+## 申请人流程
+
+1. 打开申请页，填 **QQ 号** 与 **B站 UID**（纯数字 `12345678`、`UID:12345678`、`UID = 12345678`，
+   或直接粘贴 `https://space.bilibili.com/12345678`，四种写法都认），可加备注；
+2. 站点调用 B站 公开接口核验（不需要登录 Cookie）：账号真实存在 → 等级 ≥ 下限 → 粉丝 ≥ 下限 → 昵称含关键词 → UID 未被别的 QQ 用过；
+3. 三态结果：
+   - **通过**：网页直接显示**大号验证码 + 一键复制 + 有效期**，提示把码发给群里的机器人；
+   - **未通过**：显示具体原因（等级不够/昵称不符/UID 不存在/UID 已被使用……）；
+   - **待人工**：B站 接口被风控、或本站关闭了自动核验时，转给管理员在后台处理。
+
+规则说明：**B站 明确返回"用户不存在"（`-404`）时永远不通过**；只有风控（`-799`/`-352`/HTTP 412）或网络失败才按
+`bili_on_error` 处理（`reject` 直接不通过 / `manual` 转人工 / `pass` 放行但标记未核验）。
+
+## 管理后台
+
+- 搜索（QQ/UID/昵称/备注，防抖）+ 状态筛选（全部/待审核/已通过/未通过/待人工/已拉黑）+ 分页；
+- 表格：时间、QQ、B站 UID（可点开主页）、B站 昵称、等级/粉丝、状态、验证码、备注、操作；
+- 操作：**通过 / 拒绝 / 拉黑 / 解除拉黑 / 删除记录**（危险操作二次确认）；
+- 顶部：**插件连接状态**（最近同步时间、当前验证码、已拉取条数）与统计；
+- 设置：站点名、群信息行、B站 规则（等级/粉丝/昵称关键词/一 UID 一 QQ/风控策略）、是否沿用插件规则、
+  插件地址、**重置插件 token**、**修改管理员密码**；
+- **导出 CSV**（带 BOM，Excel 直接打开不乱码）。
+
+## HTTP 接口
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| --- | --- | --- | --- |
+| GET | `/` | 无 | 申请页 |
+| GET | `/admin` | 无（未登录显示登录页） | 管理后台 |
+| GET | `/healthz` | 无 | 健康检查（版本 + 时间） |
+| POST | `/api/apply` | 无（按 IP/QQ 限流） | 提交申请；支持 JSON 与表单编码（无 JS 时返回 HTML 结果页） |
+| GET | `/api/apply/<ticket>` | 无 | 按 ticket 轮询自己的申请状态 |
+| POST | `/api/admin/login` | 密码 | 登录（失败多次按 IP 锁定 60 秒） |
+| GET | `/api/admin/applications` | 会话 | 列表（`status`/`q`/`offset`，每页 50） |
+| POST | `/api/admin/decision` | 会话 + CSRF | `approve`/`reject`/`manual`/`block`/`unblock` |
+| POST | `/api/admin/settings` | 会话 + CSRF | 保存站点设置（密码/token 留空表示不修改） |
+| POST | `/api/admin/delete` | 会话 + CSRF | 删除记录 |
+| GET | `/api/admin/export.csv` | 会话 | 导出 CSV |
+| GET | `/api/admin/logout` | 会话 | 退出登录 |
+| POST | `/api/plugin/sync` | 插件 token | 插件推送验证码/规则/绑定 |
+| GET | `/api/plugin/applications` | 插件 token | 插件拉取"已通过未投递"名单 |
+| POST | `/api/plugin/ack` | 插件 token | 插件确认已接收 |
+| GET | `/api/plugin/ping` | 插件 token | 连通性检查 |
+
+插件 token 可放 `X-Review-Token` 头、`?token=` 查询参数或请求体 `token` 字段。
+
+## 数据与隐私
+
+- 只保存：QQ 号、B站 UID、B站 公开昵称/等级/粉丝、备注、状态与原因、验证码、IP（用于限流与排查）、时间；
+- **申请人看不到别人的信息**：轮询用的是随机 32 位十六进制 ticket，无法枚举；"UID 已被使用"的错误里**不包含占用者的 QQ 号**；
+- UID 唯一性由数据库的**部分唯一索引**保证（只有 pending/approved 占用），被拒绝的人可以改 UID 再提交；
+- 想清理数据：直接在后台删除记录，或停服后删除 `review-site/data/review-site.db`。
+
+## 安全建议
+
+- 密码用 **PBKDF2-SHA256（20 万次迭代 + 随机盐）**存储，登录失败按 IP 锁定；会话是随机 token（`HttpOnly` + `SameSite=Lax`，12 小时），
+  所有写操作还要校验 **CSRF**；
+- 提交有体积上限（16 KB）与频率限制（每 IP 10 次 / 每 QQ 3 次 / 10 分钟，可在后台调整）；
+- **对外暴露时请放在 HTTPS 反代后面**（下面有 nginx 例子），并务必改掉初始密码；`plugin_token` 建议直接用启动时生成的那串；
+- 站点不需要也不应该暴露 `data/` 目录（它本来就不在静态白名单里）。
+
+### systemd（Linux）
+
+```ini
+[Unit]
+Description=Neko Court review site
+After=network.target
+
+[Service]
+WorkingDirectory=/opt/neko-court
+ExecStart=/usr/bin/python3 review-site/serve.py --host 127.0.0.1 --port 8787
+Restart=always
+User=www-data
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### nginx 反代（HTTPS）
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name review.example.com;
+    ssl_certificate     /etc/letsencrypt/live/review.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/review.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8787;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;  # 限流按真实 IP 统计
+    }
+}
+```
+
+Windows 上可以用 `pythonw.exe review-site/serve.py --host 0.0.0.0` 配合任务计划程序/NSSM 常驻。
+
+## 自检
+
+```bash
+python selftest_review_site.py     # 113 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构
+node   selftest_review_site_ui.mjs # 74 项：纯函数边界、模板契约、渲染模拟、脚本语法
+```
+
+两个自检都**离线**：B站 接口被替换成假实现，自检自己起一个真实 HTTP 服务并真发请求。
+
+## 常见问题
+
+| 现象 | 处理 |
+| --- | --- |
+| 后台显示"插件尚未连接" | 检查插件里的 `web_review_url` 是否是 AstrBot 能访问到的地址（同机用 `127.0.0.1`），以及 `web_review_token` 是否一致 |
+| 网页显示"已通过但没验证码" | 插件还没同步（刚启动/网络不通），等一个轮询周期或点后台的"重新加载"；也可以先在 QQ 里 `/审核 网站 同步` |
+| 申请老是"待人工" | B站 接口被风控。可以让站点与插件共用规则并设 `bili_on_error=pass`，或在后台手动通过 |
+| 提示"UID 已被使用"但那是本人 | 后台**解绑**：QQ 里 `/审核 解绑 <UID>`，或删除旧记录 |
+| 页面样式没生效 | `templates/` 缺失时后端会用内置极简页（功能仍在）；确认 `static/` 三个文件都在 |
+| 端口打不开 | `--host 127.0.0.1` 只监听本机；要局域网/公网访问用 `--host 0.0.0.0`，并检查防火墙 |

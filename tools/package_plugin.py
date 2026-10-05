@@ -51,6 +51,21 @@ REQUIRED_FILES = ("main.py", "metadata.yaml", "_conf_schema.json")
 JSON_FILES = ("_conf_schema.json", ".astrbot-plugin/i18n/zh-CN.json", ".astrbot-plugin/i18n/en-US.json")
 
 
+
+def update_sums(sums_path: Path, name: str, digest: str) -> None:
+    """按文件名更新 SHA256SUMS.txt（保留其它产物那一行）。"""
+    lines: list[str] = []
+    if sums_path.is_file():
+        for line in sums_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2 and parts[1].strip() == name:
+                continue
+            lines.append(line.rstrip())
+    lines.append(f"{digest}  {name}")
+    sums_path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8", newline="\n")
+
 def read_version(plugin_dir: Path) -> str:
     text = (plugin_dir / "metadata.yaml").read_text(encoding="utf-8")
     match = re.search(r"^version:\s*(\S+)\s*$", text, re.MULTILINE)
@@ -165,7 +180,7 @@ def main() -> int:
     checks = verify(out_path, plugin_name, args.out_dir.resolve() / "_verify" / plugin_name)
 
     sums = args.out_dir.resolve() / "SHA256SUMS.txt"
-    sums.write_text(f"{digest}  {out_path.name}\n", encoding="utf-8")
+    update_sums(sums, out_path.name, digest)
 
     print(f"插件：{plugin_name} {version}")
     print(f"产物：{out_path}  ({out_path.stat().st_size} 字节)")

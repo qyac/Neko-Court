@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.4",
+            version="v1.1.5",
             desc="自检用元数据",
         )
 
@@ -833,7 +833,8 @@ async def main():
         check(data["status"]["pending"] == len(plugin._state["pending"]), "GET 状态含待审核人数")
         check(bool(data["status"]["code_reset_time"]), "GET 状态含下一次重置/清理时间")
         check(data["meta"]["name"] == module.PLUGIN_NAME and data["meta"]["version"], "GET 返回插件元信息")
-        check(data["secret_fields"] == [], "本插件没有 secret 配置项")
+        check("web_review_token" in data["secret_fields"], "secret 字段被声明（web_review_token）")
+        check(data["values"]["web_review_token"] == "", "GET 不回显 secret 字段的真实值")
         check(
             isinstance(data["providers"], list)
             and data["providers"]
@@ -892,6 +893,21 @@ async def main():
         resp = await plugin.api_save_settings()
         check(resp["status_code"] == 400 and "max_attempts" in resp["payload"]["message"], "超范围数值被拒绝")
         check(plugin.config["max_attempts"] == 5, "被拒绝时不改动配置")
+
+        # secret 字段：可写入、留空不改、永不回显
+        plugin.config["web_review_token"] = ""
+        FAKE_REQUEST.payload = {"values": {"web_review_token": "tok-abcdefghijklmnop", "max_attempts": 3}}
+        resp = await plugin.api_save_settings()
+        check(
+            resp["status_code"] == 200 and plugin.config["web_review_token"] == "tok-abcdefghijklmnop",
+            "secret 字段可以保存",
+        )
+        FAKE_REQUEST.payload = {"values": {"web_review_token": "", "max_attempts": 3}}
+        resp = await plugin.api_save_settings()
+        check(plugin.config["web_review_token"] == "tok-abcdefghijklmnop", "secret 字段留空表示不修改")
+        resp = await plugin.api_get_settings()
+        check(resp["payload"]["data"]["values"]["web_review_token"] == "", "保存后 GET 依然不回显 secret")
+        plugin.config["web_review_token"] = ""
 
         FAKE_REQUEST.payload = {"values": {"match_mode": "levenshtein"}}
         resp = await plugin.api_save_settings()
@@ -1917,7 +1933,286 @@ async def main():
         context.using_provider = None
         reset_review(review_mode="rule")
 
-        print("\n[22] Pages 资源结构")
+        print("\n[22] 网页审核对接（同步 / 拉取 / 免提问）")
+        reset_review(review_mode="rule", code_send_mode="private", private_send_channel="auto")
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "1+1=?", "hint": "", "answers": ["2"], "match_mode": "inherit"}
+        ]
+        plugin.config["bili_uid_enabled"] = False
+        plugin.config["web_review_url"] = ""
+        plugin.config["web_review_token"] = ""
+        plugin.config["web_review_enabled"] = False
+        check(not plugin._web_review_enabled(), "没填 url/token 时视为未启用")
+        plugin.config["web_review_url"] = "http://127.0.0.1:8787/"
+        check(not plugin._web_review_enabled(), "只有 url 没 token 时仍未启用")
+        plugin.config["web_review_token"] = "tok-test"
+        check(not plugin._web_review_enabled(), "开关没打开时未启用")
+        plugin.config["web_review_enabled"] = True
+        check(plugin._web_review_enabled(), "三项齐全后启用")
+        check(plugin._web_review_url() == "http://127.0.0.1:8787", "url 结尾斜杠被去掉")
+
+        # 假站点：按 (method, path) 配响应
+        web_calls = []
+        responses = {}
+
+        async def fake_http(method, url, *, headers=None, payload=None, timeout=15.0):
+            path = url.split("://", 1)[1].split("/", 1)[1]
+            query = ""
+            if "?" in path:
+                path, query = path.split("?", 1)
+            web_calls.append({"method": method, "path": path, "query": query, "payload": payload})
+            item = responses.get((method, path))
+            if item is None:
+                raise AssertionError(f"自检没有为 {method} {path} 配置响应")
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        plugin._http_json = fake_http
+
+        # 快照内容
+        plugin._state["code"] = "SNAP01"
+        plugin._state["bili_uids"] = {"80000001": {"qq": "90001", "name": "网页用户", "group_id": "123456", "at": time.time()}}
+        plugin._state["pending"] = {"123456:90009": {"user_id": "90009"}}
+        plugin._state["approved"] = {}
+        snapshot = plugin._web_review_snapshot()
+        check(snapshot["token"] == "tok-test" and snapshot["code"] == "SNAP01", "快照带上 token 与验证码")
+        check(snapshot["groups"] == ["123456"], "快照带上审核群")
+        check(snapshot["bindings"] == {"80000001": "90001"}, "快照带上 UID↔QQ 绑定")
+        check(snapshot["bili"]["bili_min_level"] == 0 and "bili_on_error" in snapshot["bili"], "快照带上 B站 规则")
+        check(snapshot["stats"]["pending"] == 1, "快照带上待审核/已通过统计")
+
+        # 同步成功 / 失败
+        responses[("POST", "api/plugin/sync")] = {"ok": True, "pending_deliveries": 2}
+        web_calls.clear()
+        ok_sync, note = await plugin._web_review_sync()
+        check(ok_sync and "已同步" in note, f"同步成功（{note}）")
+        check(web_calls[0]["payload"]["token"] == "tok-test", "同步请求带上 token")
+        check(plugin._web_review_status().get("last_sync_at"), "记录最近同步时间")
+        check(plugin._web_review_status().get("pending_deliveries") == 2, "记录网站端待投递条数")
+        responses[("POST", "api/plugin/sync")] = RuntimeError("连接被拒绝")
+        ok_sync, note = await plugin._web_review_sync()
+        check(not ok_sync and "连接被拒绝" in note, "同步失败时返回原因")
+        responses[("POST", "api/plugin/sync")] = {"ok": False, "error": "token 不正确"}
+        ok_sync, note = await plugin._web_review_sync()
+        check(not ok_sync and "被拒绝" in note, "网站返回错误时如实上报")
+
+        # 拉取 + ack
+        responses[("POST", "api/plugin/sync")] = {"ok": True, "pending_deliveries": 1}
+        responses[("GET", "api/plugin/applications")] = {
+            "ok": True,
+            "count": 1,
+            "items": [{"id": 7, "qq": "90001", "uid": "80000001", "uid_name": "网页用户", "code": "SNAP01", "decided_at": time.time()}],
+        }
+        responses[("POST", "api/plugin/ack")] = {"ok": True, "acked": 1}
+        web_calls.clear()
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 1 and "1 条" in note, f"拉取到 1 条（{note}）")
+        record = plugin._state["approved"].get("123456:90001") or {}
+        check(record.get("source") == "web", "网页通过的记录标记 source=web")
+        check(record.get("bili_uid") == "80000001" and record.get("bili_name") == "网页用户", "记录带上 B站 UID 与昵称")
+        check("123456:90001" not in plugin._state["pending"], "进来后不再留在待审核队列")
+        ack_call = [c for c in web_calls if c["path"] == "api/plugin/ack"]
+        check(ack_call and ack_call[0]["payload"]["ids"] == [7], "拉取后按编号 ack")
+        check(plugin._web_review_status().get("pulled") == 1, "累计接收数增加")
+        responses[("GET", "api/plugin/applications")] = {"ok": True, "count": 0, "items": []}
+        web_calls.clear()
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 0 and not [c for c in web_calls if c["path"] == "api/plugin/ack"], "没有新记录时不 ack")
+        responses[("GET", "api/plugin/applications")] = RuntimeError("超时")
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 0 and "失败" in note, "拉取失败时返回原因")
+
+        # 网页已通过的人入群：不提问、直接发码
+        plugin.config["web_review_auto_approve"] = True
+        client.fail_temp_session = False
+        client.temp_sessions.clear()
+        join = FakeEvent(post_type="notice", notice_type="group_increase", user_id="90001")
+        await plugin.on_group_notice(join)
+        check(not join.sent, "网页已通过者入群时不再提问")
+        check(
+            client.temp_sessions and str(client.temp_sessions[-1]["user_id"]) == "90001"
+            and plugin._state["code"] in str(client.temp_sessions[-1]["message"]),
+            "直接把当日验证码私发给他",
+        )
+        check("123456:90001" not in plugin._state["pending"], "没有为已通过者建待审核记录")
+        check(plugin._diag["counters"].get("web_approved") == 1, "网页免提问计数被记录")
+
+        # 关闭自动发码：回到正常提问流程
+        plugin.config["web_review_auto_approve"] = False
+        plugin._state["approved"]["123456:90002"] = {
+            "at": time.time(), "code": "", "source": "web", "bili_uid": "80000002", "question": "网页审核"
+        }
+        join2 = FakeEvent(post_type="notice", notice_type="group_increase", user_id="90002")
+        await plugin.on_group_notice(join2)
+        check(any("1+1=?" in text for text in texts_of(join2.sent)), "关闭自动发码后仍按正常流程提问")
+        plugin.config["web_review_auto_approve"] = True
+
+        # 指令
+        plugin.config["web_review_enabled"] = False
+        off_text = chain_text([r async for r in plugin.review_website(admin_event)][0])
+        check("未启用" in off_text, "指令：未启用时给出提示")
+        plugin.config["web_review_enabled"] = True
+        plugin.config["web_review_token"] = ""
+        no_token = chain_text([r async for r in plugin.review_website(admin_event)][0])
+        check("没填" in no_token, "指令：缺 token 时告警")
+        plugin.config["web_review_token"] = "tok-test"
+        status_text = chain_text([r async for r in plugin.review_website(admin_event)][0])
+        check("网页审核对接" in status_text and "127.0.0.1:8787" in status_text, "指令：显示站点与状态")
+        check("累计接收" in status_text, "指令：显示累计接收条数")
+        responses[("POST", "api/plugin/sync")] = {"ok": True, "pending_deliveries": 0}
+        responses[("GET", "api/plugin/applications")] = {"ok": True, "count": 0, "items": []}
+        sync_replies = [r async for r in plugin.review_website(admin_event, "同步")]
+        check("正在同步" in chain_text(sync_replies[0]) and "已同步" in chain_text(sync_replies[-1]), "指令：同步动作有回执")
+        check(
+            "只有管理员" in chain_text([r async for r in plugin.review_website(FakeEvent(user_id="10001"))][0]),
+            "指令有权限校验",
+        )
+
+        # 诊断与后台任务
+        diag_text = chain_text([r async for r in plugin.review_diagnose(admin_event)][0])
+        check("网页审核：✅ 已启用" in diag_text, "诊断报告包含网页审核状态")
+        plugin._loops.clear()
+        plugin.config["web_review_enabled"] = True
+        plugin.config["web_review_url"] = "http://127.0.0.1:8787"
+        plugin._ensure_loops()
+        check(len(plugin._loops) == 3, f"启用网页审核后多一个后台任务（{len(plugin._loops)}）")
+        for task in plugin._loops:
+            task.cancel()
+        plugin._loops.clear()
+        await asyncio.sleep(0)
+
+        # 收尾
+        plugin.__dict__.pop("_http_json", None)
+        plugin.config["web_review_enabled"] = False
+        plugin.config["web_review_url"] = ""
+        plugin.config["web_review_token"] = ""
+        plugin._state["approved"] = {}
+        plugin._state["pending"] = {}
+        plugin._state["bili_uids"] = {}
+        reset_review(review_mode="rule")
+
+        print("\n[23] 端到端联调：真实站点 + 真实 HTTP")
+        site_root = PLUGIN_MAIN.parent.parent / "review-site"
+        if not site_root.is_dir():
+            # 单独校验插件包时（解压 zip）不会有 review-site，跳过而不是判失败
+            print(f"  SKIP  未找到审核站点目录（{site_root}），跳过端到端联调")
+        else:
+            sys.path.insert(0, str(site_root))
+            import app as site_app  # noqa: E402
+            import bili as site_bili  # noqa: E402
+            from store import Store as SiteStore  # noqa: E402
+            import threading  # noqa: E402
+            import urllib.request  # noqa: E402
+
+            e2e_dir = PLUGIN_MAIN.parent.parent / ".selftest_data" / "e2e"
+            shutil.rmtree(e2e_dir, ignore_errors=True)
+            e2e_dir.mkdir(parents=True, exist_ok=True)
+            site_store = SiteStore(e2e_dir / "e2e.db")
+            site_store.set_setting("plugin_token", "e2e-token-1234567890")
+            site_store.set_setting("use_plugin_rules", False)
+            site_bili._fetch_json = lambda url, timeout, referer: {
+                "code": 0,
+                "data": {
+                    "card": {"name": "端到端用户", "fans": 10, "level_info": {"current_level": 3}},
+                    "follower": 10,
+                },
+            }
+            site_bili.clear_cache()
+            site_server = site_app.make_server(host="127.0.0.1", port=0, store=site_store)
+            site_port = site_server.server_address[1]
+            threading.Thread(target=site_server.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{site_port}"
+
+            def site_post(path, payload):
+                request = urllib.request.Request(
+                    base + path,
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=20) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+
+            try:
+                status, body = site_post("/api/apply", {"qq": "91001", "uid": "82000001"})
+                check(status == 200 and body["status"] == "approved", f"申请人在真实站点上提交并通过（{status}）")
+                status, body = site_post("/api/apply", {"qq": "91002", "uid": "82000002"})
+                check(body["status"] == "approved", "第二位申请人也通过")
+
+                # 恢复插件的真实 HTTP 实现，让插件真的去访问站点
+                plugin.__dict__.pop("_http_json", None)
+                plugin.config["web_review_enabled"] = True
+                plugin.config["web_review_url"] = base
+                plugin.config["web_review_token"] = "e2e-token-1234567890"
+                plugin.config["web_review_auto_approve"] = True
+                plugin._state["approved"] = {}
+                plugin._state["pending"] = {}
+                plugin._state["bili_uids"] = {}
+                plugin._state["code"] = "E2E001"
+                plugin._state["web_review"] = {}  # 只统计这一节接收到的条数
+                synced, pulled, note = await plugin._web_review_once()
+                check(synced, f"插件真实 HTTP 同步成功（{note}）")
+                check(pulled == 2, f"插件真实 HTTP 拉取到 2 条（{pulled}）")
+                check(
+                    plugin._state["approved"].get("123456:91001", {}).get("source") == "web",
+                    "插件状态里写入网页通过记录",
+                )
+                check(plugin._bili_bound_qq("82000001") == "91001", "B站 UID 绑定被同步回插件")
+                check(site_store.get_setting("plugin_code") == "E2E001", "站点侧收到了插件同步的验证码")
+                check(site_store.get_setting("plugin_synced_at"), "站点记录了同步时间")
+
+                # 站点把验证码展示给后来提交的申请人
+                status, body = site_post("/api/apply", {"qq": "91003", "uid": "82000003"})
+                check(body["code"] == "E2E001", f"网页直接显示插件同步来的验证码（{body['code']}）")
+
+                # 网页已通过者入群：不提问、直接发码
+                client.fail_temp_session = False
+                client.temp_sessions.clear()
+                e2e_join = FakeEvent(post_type="notice", notice_type="group_increase", user_id="91001")
+                await plugin.on_group_notice(e2e_join)
+                check(not e2e_join.sent, "端到端：网页已通过者入群不再提问")
+                check(
+                    client.temp_sessions and "E2E001" in str(client.temp_sessions[-1]["message"]),
+                    "端到端：直接私发当日验证码",
+                )
+
+                # 第三位申请人是在第一轮之后提交的，所以再拉一轮会收到这 1 条
+                synced, pulled, note = await plugin._web_review_once()
+                check(synced and pulled == 1, f"端到端：新提交的申请被增量拉取（{note}）")
+                check(
+                    plugin._state["approved"].get("123456:91003", {}).get("source") == "web",
+                    "第三位申请人也写入网页通过记录",
+                )
+                # 幂等：已经接收过的不会被重复接收
+                synced, pulled, note = await plugin._web_review_once()
+                check(synced and pulled == 0, f"端到端：已接收过的不再重复（{note}）")
+                check(plugin._web_review_status().get("pulled") == 3, "累计接收数正确（3 条）")
+
+                # 站点侧换码后，插件下一轮同步会把新码推上去
+                plugin._state["code"] = "E2E002"
+                synced, pulled, note = await plugin._web_review_once()
+                check(site_store.get_setting("plugin_code") == "E2E002", "换码后站点侧同步更新")
+                check(
+                    all(
+                        row["code"] == "E2E002"
+                        for row in site_store.all_approved()
+                    ),
+                    "站点上已通过记录的验证码一起刷新",
+                )
+            finally:
+                site_server.shutdown()
+                site_server.server_close()
+                plugin.__dict__.pop("_http_json", None)
+                plugin.config["web_review_enabled"] = False
+                plugin.config["web_review_url"] = ""
+                plugin.config["web_review_token"] = ""
+                plugin._state["approved"] = {}
+                plugin._state["pending"] = {}
+                plugin._state["bili_uids"] = {}
+                reset_review(review_mode="rule")
+
+        print("\n[24] Pages 资源结构")
         pages = {
             "settings": ("index.html", "app.js", "settings.js", "style.css"),
             "questions": ("index.html", "app.js", "bank.js", "style.css"),

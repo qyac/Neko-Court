@@ -308,6 +308,42 @@
       "step": 1.0
     }
   },
+  "web_review_enabled": {
+    "type": "bool",
+    "description": "启用网页审核对接",
+    "hint": "打开后，插件会定期把当前验证码/规则推给审核网站，并把网站上已通过的名单同步进来（这些人入群时不再提问，直接发码）。",
+    "default": false
+  },
+  "web_review_url": {
+    "type": "string",
+    "description": "审核网站地址",
+    "hint": "审核网站的基础地址，例如 http://127.0.0.1:8787 或 https://review.example.com（不要带结尾斜杠）。插件会主动出站访问它，所以站点不需要能访问 AstrBot。",
+    "default": ""
+  },
+  "web_review_token": {
+    "type": "string",
+    "description": "网页审核共享 token",
+    "hint": "审核网站启动时控制台会打印这个 token，把它填到这里（站点侧无需再配）。留空表示不修改已保存的值。",
+    "default": "",
+    "secret": true
+  },
+  "web_review_poll_seconds": {
+    "type": "int",
+    "description": "同步/拉取间隔（秒）",
+    "hint": "每隔多久同步一次验证码并拉取网页通过名单。网页申请人越多可以调小一点。",
+    "default": 30,
+    "slider": {
+      "min": 10,
+      "max": 600,
+      "step": 5
+    }
+  },
+  "web_review_auto_approve": {
+    "type": "bool",
+    "description": "网页通过者入群免提问",
+    "hint": "开启后，网页审核通过的人进群时不再提问，直接私发当日验证码；关闭则仍按正常流程提问。",
+    "default": true
+  },
   "code_length": {
     "type": "int",
     "description": "验证码长度",

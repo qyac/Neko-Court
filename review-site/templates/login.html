@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<title>$site_name · 管理员登录</title>
+<link rel="stylesheet" href="./static/style.css">
+</head>
+<body class="page page-login">
+<a class="skip-link" href="#main">跳到登录表单</a>
+
+<header class="site-header">
+  <div class="wrap">
+    <h1 class="site-name">$site_name</h1>
+    <p class="site-subtitle">管理后台登录</p>
+  </div>
+</header>
+
+<main id="main" class="wrap">
+  <div id="alert-bar" class="alert alert-error" role="alert" hidden></div>
+
+  <section class="card login-card" aria-label="管理员登录">
+    <h2 class="card-title">管理员登录</h2>
+
+    <div id="login-error-slot">$error_html</div>
+
+    <form id="login-form" method="post" action="./api/admin/login">
+      <div class="field">
+        <label for="password">管理员密码</label>
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               required aria-describedby="password-error">
+        <p class="field-error" id="password-error" role="alert"></p>
+      </div>
+      <button type="submit" id="login-submit" class="btn btn-primary btn-block">登录</button>
+    </form>
+
+    <p class="hint">忘记密码时，可在服务器上用 <code>--admin-password</code> 重新设置一次；连错 5 次会临时锁定 60 秒。</p>
+    <p class="small"><a href="./">返回入群申请页</a></p>
+  </section>
+</main>
+
+<footer class="site-footer" id="site-footer">$footer_html</footer>
+<script type="module" src="./static/app.js"></script>
+</body>
+</html>

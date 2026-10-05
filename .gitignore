@@ -5,6 +5,9 @@ __pycache__/
 .venv/
 venv/
 
+# 审核网站的本地数据（SQLite）
+review-site/data/
+
 # 自检 / 打包产物
 .selftest_data/
 dist/

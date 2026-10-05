@@ -51,6 +51,17 @@ export const FIELD_GROUPS = [
     ],
   },
   {
+    id: "web",
+    title: "网页审核对接",
+    keys: [
+      "web_review_enabled",
+      "web_review_url",
+      "web_review_token",
+      "web_review_poll_seconds",
+      "web_review_auto_approve",
+    ],
+  },
+  {
     id: "code",
     title: "验证码",
     keys: [
