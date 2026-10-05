@@ -43,17 +43,19 @@ def ensure_defaults(store: Store, *, admin_password: str = "", plugin_token: str
     return created
 
 
-def print_banner(store: Store, host: str, port: int) -> None:
+def print_banner(store: Store, host: str, port: int, *, trust_proxy: bool = False) -> None:
     settings = store.all_settings()
     shown_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
     print("=" * 66)
-    print(f"临时审核群 · 审核网站  v{app_module.SITE_VERSION}")
+    print(f"临时审核群 · 审核网站  {app_module.SITE_VERSION}")
     print("=" * 66)
     print(f"申请页（发给群友）：   http://{shown_host}:{port}/")
     print(f"管理后台：             http://{shown_host}:{port}/admin")
     print(f"数据文件：             {store.path}")
     if host in ("0.0.0.0", "::"):
         print("提示：监听 0.0.0.0，外网/局域网可用本机 IP 访问；B站 核验需要服务器能出网。")
+    if not trust_proxy:
+        print("提示：未开启 --trust-proxy，限流与日志按 TCP 源地址统计；放在反代后面时请打开它。")
     if not render.template_exists("apply.html"):
         print("提示：templates/apply.html 不存在，正在使用内置的极简页面。")
     print("-" * 66)
@@ -79,6 +81,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--admin-password", default="", help="设置/重置管理员密码（留空则首次启动随机生成）")
     parser.add_argument("--plugin-token", default="", help="设置/重置插件共享 token（留空则首次启动随机生成）")
     parser.add_argument("--print-config", action="store_true", help="只打印配置与插件需要填写的内容，然后退出")
+    parser.add_argument(
+        "--trust-proxy",
+        action="store_true",
+        help="部署在反向代理后面时打开：只有这时才读 X-Forwarded-For（否则客户端可以伪造 IP 绕过限流）",
+    )
     args = parser.parse_args(argv)
 
     store = Store(Path(args.data) / "review-site.db")
@@ -91,11 +98,11 @@ def main(argv: list[str] | None = None) -> int:
     if created.get("plugin_token"):
         print(f"已生成插件 token：{created['plugin_token']}")
 
-    print_banner(store, args.host, args.port)
+    print_banner(store, args.host, args.port, trust_proxy=args.trust_proxy)
     if args.print_config:
         return 0
 
-    server = app_module.make_server(host=args.host, port=args.port, store=store)
+    server = app_module.make_server(host=args.host, port=args.port, store=store, trust_proxy=args.trust_proxy)
     print("服务已启动，Ctrl+C 停止。")
     try:
         server.serve_forever()

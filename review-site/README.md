@@ -105,7 +105,8 @@ python review-site/serve.py --print-config
 | POST | `/api/plugin/ack` | 插件 token | 插件确认已接收 |
 | GET | `/api/plugin/ping` | 插件 token | 连通性检查 |
 
-插件 token 可放 `X-Review-Token` 头、`?token=` 查询参数或请求体 `token` 字段。
+插件 token 优先用 `X-Review-Token` **请求头**（插件默认就是这么发的，URL 里不会出现密钥）；
+为兼容也接受 `?token=` 查询参数或请求体 `token` 字段——但查询串会进浏览器历史与反代日志，不推荐。
 
 ## 数据与隐私
 
@@ -116,10 +117,27 @@ python review-site/serve.py --print-config
 
 ## 安全建议
 
+已经做了这些（都有回归测试）：
+
+- **不信任 X-Forwarded-For**：默认按 TCP 源地址统计限流与记录日志。`X-Forwarded-For` 是客户端可伪造的头，
+  无条件信任它既能绕过节流、也能伪造成管理员 IP 去触发登录锁定；只有**确实放在反向代理后面**时才加
+  `--trust-proxy`（此时取最右一项，即最靠近本站的代理写入的地址）。
+- **登录双重限流**：单 IP 连续 5 次失败锁定 60 秒，另有**全局**阈值（5 分钟 60 次）挡住换 IP 的撞库。
+- **改密码即踢线**：修改管理员密码会立刻作废其它所有会话（怀疑泄露时最有用），当前会话保留。
+- **动态响应 `Cache-Control: no-store`**：验证码所在的结果页不会被浏览器或中间缓存留下来。
+- **CSV 公式注入防护**：B站 昵称与备注是外部可控内容，导出时对 `= + - @` 开头的单元格加前导单引号，
+  避免管理员用 Excel 打开时执行 `=cmd|...` 这类公式。
+- **请求体要么读完、要么关连接**：避免 keep-alive 连接上残留字节被当成下一个请求（请求错位/走私）。
+- **错误不外泄**：内部异常只回"错误编号"，细节只写进服务器端日志；日志本身会隐藏查询串（token 可能出现在 `?token=` 里）。
+- **其它**：`nosniff` + `X-Frame-Options: DENY` + CSP + `Permissions-Policy`；HTTPS 场景自动加 `Secure` cookie 与 HSTS；
+  会话 12 小时过期并定期清理；B站 查询缓存有上限；站点日志表只保留最近 2000 条。
+
+部署时还要注意：
+
 - 密码用 **PBKDF2-SHA256（20 万次迭代 + 随机盐）**存储，登录失败按 IP 锁定；会话是随机 token（`HttpOnly` + `SameSite=Lax`，12 小时），
   所有写操作还要校验 **CSRF**；
 - 提交有体积上限（16 KB）与频率限制（每 IP 10 次 / 每 QQ 3 次 / 10 分钟，可在后台调整）；
-- **对外暴露时请放在 HTTPS 反代后面**（下面有 nginx 例子），并务必改掉初始密码；`plugin_token` 建议直接用启动时生成的那串；
+- **对外暴露时请放在 HTTPS 反代后面**（下面有 nginx 例子）并加 `--trust-proxy`，务必改掉初始密码；`plugin_token` 建议直接用启动时生成的那串；
 - 站点不需要也不应该暴露 `data/` 目录（它本来就不在静态白名单里）。
 
 ### systemd（Linux）
@@ -141,6 +159,12 @@ WantedBy=multi-user.target
 
 ### nginx 反代（HTTPS）
 
+反代部署时记得给站点加 `--trust-proxy`，否则限流会把所有请求算在代理 IP 上：
+
+```bash
+python review-site/serve.py --host 127.0.0.1 --port 8787 --trust-proxy
+```
+
 ```nginx
 server {
     listen 443 ssl;
@@ -161,7 +185,7 @@ Windows 上可以用 `pythonw.exe review-site/serve.py --host 0.0.0.0` 配合任
 ## 自检
 
 ```bash
-python selftest_review_site.py     # 113 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构
+python selftest_review_site.py     # 149 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
 node   selftest_review_site_ui.mjs # 74 项：纯函数边界、模板契约、渲染模拟、脚本语法
 ```
 

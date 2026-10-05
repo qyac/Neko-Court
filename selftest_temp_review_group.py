@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.5",
+            version="v1.1.6",
             desc="自检用元数据",
         )
 
@@ -1950,6 +1950,9 @@ async def main():
         plugin.config["web_review_enabled"] = True
         check(plugin._web_review_enabled(), "三项齐全后启用")
         check(plugin._web_review_url() == "http://127.0.0.1:8787", "url 结尾斜杠被去掉")
+        plugin.config["web_review_url"] = "file:///C:/Windows/win.ini"
+        check(plugin._web_review_url() == "" and not plugin._web_review_enabled(), "拒绝非 http(s) 的站点地址")
+        plugin.config["web_review_url"] = "http://127.0.0.1:8787"
 
         # 假站点：按 (method, path) 配响应
         web_calls = []
@@ -1960,7 +1963,9 @@ async def main():
             query = ""
             if "?" in path:
                 path, query = path.split("?", 1)
-            web_calls.append({"method": method, "path": path, "query": query, "payload": payload})
+            web_calls.append(
+                {"method": method, "path": path, "query": query, "payload": payload, "headers": dict(headers or {})}
+            )
             item = responses.get((method, path))
             if item is None:
                 raise AssertionError(f"自检没有为 {method} {path} 配置响应")
@@ -2014,6 +2019,12 @@ async def main():
         check("123456:90001" not in plugin._state["pending"], "进来后不再留在待审核队列")
         ack_call = [c for c in web_calls if c["path"] == "api/plugin/ack"]
         check(ack_call and ack_call[0]["payload"]["ids"] == [7], "拉取后按编号 ack")
+        check(
+            ack_call and ack_call[0]["headers"].get("X-Review-Token") == "tok-test",
+            "ack 用请求头带 token 而不是放进 URL",
+        )
+        pull_call = [c for c in web_calls if c["path"] == "api/plugin/applications"]
+        check(pull_call and "token=" not in pull_call[0]["query"], f"拉取 URL 里不出现 token（{pull_call[0]['query'] if pull_call else ''}）")
         check(plugin._web_review_status().get("pulled") == 1, "累计接收数增加")
         responses[("GET", "api/plugin/applications")] = {"ok": True, "count": 0, "items": []}
         web_calls.clear()

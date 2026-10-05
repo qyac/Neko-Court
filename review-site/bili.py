@@ -24,6 +24,7 @@ USER_AGENT = (
 )
 NOT_FOUND_CODES = {-400, -404, 62002}
 CACHE_TTL = 600.0
+CACHE_MAX = 5000  # 缓存条目上限，防止被大量不同 UID 刷爆内存
 RETRY_DELAY = 1.0
 
 _UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})(?!\d)", re.I)
@@ -114,6 +115,13 @@ def lookup(uid: str, *, timeout: float = 10.0, retry_delay: float = RETRY_DELAY)
         "sign": str(card.get("sign") or ""),
         "at": now,
     }
+    if len(_cache) >= CACHE_MAX:
+        # 简单清理：先删过期，还不够就丢掉最早写入的一半
+        for key in [k for k, v in _cache.items() if now - v[0] >= CACHE_TTL]:
+            _cache.pop(key, None)
+        if len(_cache) >= CACHE_MAX:
+            for key in sorted(_cache, key=lambda k: _cache[k][0])[: CACHE_MAX // 2]:
+                _cache.pop(key, None)
     _cache[uid] = (now, dict(info))
     return info, "", ""
 

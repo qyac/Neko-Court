@@ -53,15 +53,19 @@ JSON_FILES = ("_conf_schema.json", ".astrbot-plugin/i18n/zh-CN.json", ".astrbot-
 
 
 def update_sums(sums_path: Path, name: str, digest: str) -> None:
-    """按文件名更新 SHA256SUMS.txt（保留其它产物那一行）。"""
+    """按文件名更新 SHA256SUMS.txt：保留其它仍存在的产物，清掉已被删除的旧行。"""
+    directory = sums_path.parent
     lines: list[str] = []
     if sums_path.is_file():
         for line in sums_path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
             parts = line.split(None, 1)
-            if len(parts) == 2 and parts[1].strip() == name:
+            if len(parts) != 2:
                 continue
+            listed = parts[1].strip()
+            if listed == name:
+                continue
+            if not (directory / listed).is_file():
+                continue  # 产物已被删除（例如旧版本），不再留在清单里
             lines.append(line.rstrip())
     lines.append(f"{digest}  {name}")
     sums_path.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8", newline="\n")

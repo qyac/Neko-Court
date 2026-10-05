@@ -370,11 +370,17 @@ class Store:
 
     # ------------------------------------------------------------------ 日志
 
+    LOG_KEEP = 2000  # 只保留最近这么多条，避免被刷量撑爆磁盘
+
     def log(self, action: str, *, actor: str = "", detail: str = "") -> None:
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO logs(at, actor, action, detail) VALUES(?,?,?,?)",
                 (time.time(), actor, action, detail[:500]),
+            )
+            conn.execute(
+                "DELETE FROM logs WHERE id <= (SELECT MAX(id) FROM logs) - ?",
+                (self.LOG_KEEP,),
             )
             conn.commit()
 

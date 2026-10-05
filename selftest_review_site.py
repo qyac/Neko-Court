@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import http.client as http_client
 import json
 import re
 import shutil
@@ -67,7 +68,7 @@ class Client:
         self.base = base
         self.cookie = ""
 
-    def __call__(self, path, *, method="GET", payload=None, token="", form=None, cookie=None):
+    def __call__(self, path, *, method="GET", payload=None, token="", form=None, cookie=None, headers=None):
         data = None
         if form is not None:
             data = urllib.parse.urlencode(form).encode()
@@ -82,6 +83,8 @@ class Client:
             request.add_header("Content-Type", content_type)
         if token:
             request.add_header("X-Review-Token", token)
+        for key, value in (headers or {}).items():
+            request.add_header(key, value)
         jar = self.cookie if cookie is None else cookie
         if jar:
             request.add_header("Cookie", jar)
@@ -408,6 +411,208 @@ def main() -> int:
         check("已通过" in body or "未通过" in body or "待" in body, "结果页包含状态文案")
         status, body, _ = http("/api/apply", method="POST", form={"qq": "bad", "uid": "73000002"})
         check(status == 400 and "QQ" in body, "表单提交的错误也渲染成页面")
+
+        print("\n[8] 安全加固回归")
+        from http.server import BaseHTTPRequestHandler as _BH  # noqa: E402
+
+        # 1) X-Forwarded-For 默认不被信任：伪造 IP 也拿不到新额度
+        store.set_setting("apply_per_ip", 1)
+        server.app.apply_limiter.reset("ip:127.0.0.1")
+        forged_a = http.json("/api/apply", method="POST", payload={"qq": "12345101", "uid": "74000001"}, headers={"X-Forwarded-For": "1.1.1.1"})
+        forged_b = http.json("/api/apply", method="POST", payload={"qq": "12345102", "uid": "74000002"}, headers={"X-Forwarded-For": "2.2.2.2"})
+        check(forged_a[0] == 200 and forged_b[0] == 429, f"伪造 X-Forwarded-For 不能绕过限流（{forged_a[0]}/{forged_b[0]}）")
+        store.set_setting("apply_per_ip", 200)
+        server.app.apply_limiter.reset("ip:127.0.0.1")
+
+        # 2) 明确开启代理信任时，取最右一项（最靠近本站的代理写的）
+        server.app.trust_proxy = True
+        try:
+            status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12345103", "uid": "74000003"}, headers={"X-Forwarded-For": "1.1.1.1, 9.9.9.9"})
+            check(status == 200, "开启 trust_proxy 后仍可提交")
+            row = next((r for r in store.list_applications(status="all", limit=100)[0] if r["qq"] == "12345103"), {})
+            check(row.get("ip") == "9.9.9.9", f"取 XFF 最右一项（实际 {row.get('ip')}）")
+            status, data, _ = http.json("/api/admin/login", method="POST", payload={"password": "wrong"}, headers={"X-Forwarded-For": "9.9.9.9"})
+            check(status == 401, "（前置）按伪造 IP 记录登录失败")
+        finally:
+            server.app.trust_proxy = False
+
+        # 3) 日志脱敏：查询串（可能含 token）不写进日志
+        redacted = app_module.Handler._redact("GET /api/plugin/ping?token=SECRET-VALUE HTTP/1.1")
+        check("SECRET-VALUE" not in redacted and "已隐藏" in redacted, f"日志隐藏查询串（{redacted}）")
+        check(app_module.Handler._redact("POST /api/apply HTTP/1.1") == "POST /api/apply HTTP/1.1", "无查询串的日志保持原样")
+        check(app_module.Handler._redact("GET /x?a=1 HTTP/1.1").endswith("HTTP/1.1"), "脱敏后保留 HTTP 版本")
+
+        # 4) 500 不回显内部细节，只给错误编号
+        original = store.list_applications
+        def boom(*args, **kwargs):
+            raise RuntimeError("内部路径 C:/secret/review.db 泄露测试")
+        store.list_applications = boom
+        try:
+            status, data, _ = http.json("/api/admin/applications", cookie=http.cookie)
+            check(status == 500, "内部异常返回 500")
+            check("secret" not in json.dumps(data) and "错误编号" in data.get("error", ""), f"不回显内部细节（{data.get('error')}）")
+        finally:
+            store.list_applications = original
+
+        # 5) 动态响应禁止缓存（验证码不能被中间缓存留下）
+        for path in ("/", "/admin", f"/api/apply/{ticket}"):
+            status, body, headers = http(path, cookie=http.cookie)
+            check(status == 200 and headers.get("Cache-Control") == "no-store", f"{path} 带 Cache-Control: no-store")
+        status, body, headers = http("/static/style.css")
+        check(headers.get("Cache-Control") != "no-store", "静态资源仍可缓存")
+
+        # 6) CSV 公式注入防护
+        store.create_application(
+            qq="12345110",
+            uid="75000001",
+            status="approved",
+            uid_name='+HYPERLINK("http://evil.example","点我")',
+            note="=cmd|'/c calc'!A0",
+            code="X1",
+        )
+        status, body, _ = http("/api/admin/export.csv", cookie=http.cookie)
+        check(status == 200, "导出 CSV 成功")
+        check("'=cmd" in body and "'+HYPERLINK" in body, "危险单元格被加前导单引号（公式注入防护）")
+
+        # 7) 改密码会作废其它会话
+        first = Client(f"http://127.0.0.1:{port}")
+        second = Client(f"http://127.0.0.1:{port}")
+        st1, _, _ = first.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        st2, _, _ = second.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        check(st1 == 200 and st2 == 200, "两个会话都登录成功")
+        st, data, _ = first.json("/api/admin/settings", cookie=first.cookie)
+        csrf1 = ""
+        st, body, _ = first("/admin", cookie=first.cookie)
+        match1 = re.search(r'"csrf":\s*"([^"]+)"', body)
+        csrf1 = match1.group(1) if match1 else ""
+        check(bool(csrf1), "（前置）拿到 CSRF")
+        st, data, _ = first.json(
+            "/api/admin/settings",
+            method="POST",
+            payload={"csrf": csrf1, "admin_password": "new-pw-98765432"},
+            cookie=first.cookie,
+        )
+        check(st == 200, "改密码成功")
+        st_old, _, _ = second.json("/api/admin/applications", cookie=second.cookie)
+        st_new, _, _ = first.json("/api/admin/applications", cookie=first.cookie)
+        check(st_old == 401, "改密码后其它会话被作废")
+        check(st_new == 200, "当前会话仍然有效")
+        # 改回来并确认新密码生效
+        st, body, _ = first("/admin", cookie=first.cookie)
+        match2 = re.search(r'"csrf":\s*"([^"]+)"', body)
+        st, data, _ = first.json(
+            "/api/admin/settings",
+            method="POST",
+            payload={"csrf": (match2.group(1) if match2 else csrf1), "admin_password": "pw-12345678"},
+            cookie=first.cookie,
+        )
+        check(st == 200, "密码已改回")
+        fresh = Client(f"http://127.0.0.1:{port}")
+        st, _, _ = fresh.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        check(st == 200, "新密码可登录")
+
+        # 8) 脏输入给 400 而不是 500
+        server.app.login_limiter.reset("login:127.0.0.1")
+        admin = Client(f"http://127.0.0.1:{port}")
+        admin.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        st, body, _ = admin("/admin", cookie=admin.cookie)
+        m3 = re.search(r'"csrf":\s*"([^"]+)"', body)
+        csrf3 = m3.group(1) if m3 else ""
+        for bad in ({"bili_min_level": ["a"]}, {"bili_min_fans": {"x": 1}}):
+            st, data, _ = admin.json("/api/admin/settings", method="POST", payload={"csrf": csrf3, **bad}, cookie=admin.cookie)
+            check(st == 400, f"脏输入 {list(bad)[0]} 返回 400（{st}）")
+
+        # 9) HTTPS 场景：Secure cookie + HSTS
+        https_client = Client(f"http://127.0.0.1:{port}")
+        server.app.login_limiter.reset("login:127.0.0.1")
+        st, data, headers = https_client.json(
+            "/api/admin/login",
+            method="POST",
+            payload={"password": "pw-12345678"},
+            headers={"X-Forwarded-Proto": "https"},
+        )
+        cookie_header = str(headers.get("Set-Cookie") or "")
+        check("Secure" in cookie_header, f"HTTPS 下 cookie 带 Secure（{cookie_header}）")
+        hsts = str(headers.get("Strict-Transport-Security") or "")
+        check("max-age=" in hsts, f"HTTPS 下返回 HSTS（{hsts}）")
+        st, data, headers = http.json("/api/admin/login", method="POST", payload={"password": "pw-12345678"})
+        plain_cookie = str(headers.get("Set-Cookie") or "")
+        check("Secure" not in plain_cookie, "纯 HTTP 下不加 Secure（避免本地调试登录不上）")
+
+        # 10) 日志限长（防刷量撑爆磁盘）
+        for index in range(2100):
+            store.log("noise", actor="test", detail=f"n{index}")
+        kept = len(store.recent_logs(9999))
+        check(kept <= store.LOG_KEEP + 10, f"日志表被限制在 {store.LOG_KEEP} 条左右（实际 {kept}）")
+
+        # 11) 请求体必须读完：否则 keep-alive 连接上会请求错位（走私）
+        conn = http_client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            body = json.dumps({"csrf": "x", "id": 1, "action": "reject"}).encode()
+            conn.request(
+                "POST",
+                "/api/admin/decision",
+                body=body,
+                headers={"Content-Type": "application/json", "Cookie": "review_admin=bogus"},
+            )
+            first = conn.getresponse()
+            first_body = first.read()
+            check(first.status == 401, f"（前置）未登录的 POST 返回 401（{first.status}）")
+            # 同一条连接紧接着发第二个请求：如果上一个请求体没被读完，这里会拿到错位响应
+            conn.request("GET", "/healthz")
+            second = conn.getresponse()
+            second_body = second.read().decode("utf-8", "replace")
+            check(
+                second.status == 200 and json.loads(second_body).get("ok") is True,
+                f"同连接的下一个请求仍然正常（{second.status}）",
+            )
+        finally:
+            conn.close()
+
+        oversize = http(
+            "/api/apply",
+            method="POST",
+            payload={"qq": "12345120", "uid": "76000001", "note": "x" * (app_module.MAX_BODY_BYTES + 500)},
+        )
+        check(oversize[0] == 400, f"超大请求体返回 400（{oversize[0]}）")
+        check("close" in str(oversize[2].get("Connection") or "").lower(), "超大请求体时要求关闭连接（不再复用）")
+
+        # 12) 全局登录阈值：换 IP 也挡得住撞库
+        server.app.trust_proxy = True
+        server.app.login_limiter.reset("login:8.8.8.1")
+        original_global = server.app.login_global
+        server.app.login_global = app_module.RateLimiter(2, 60.0)
+        try:
+            codes = []
+            for index in range(3):
+                status, _, _ = http.json(
+                    "/api/admin/login",
+                    method="POST",
+                    payload={"password": "wrong"},
+                    headers={"X-Forwarded-For": f"8.8.8.{index + 1}"},
+                )
+                codes.append(status)
+            check(codes[:2] == [401, 401] and codes[2] == 429, f"全局阈值触发后换 IP 也是 429（{codes}）")
+        finally:
+            server.app.login_global = original_global
+            server.app.trust_proxy = False
+
+        # 13) B站 查询缓存有上限（防止被大量不同 UID 刷爆内存）
+        original_max = site_bili_max = bili.CACHE_MAX
+        bili.CACHE_MAX = 5
+        bili.clear_cache()
+        try:
+            for index in range(12):
+                bili.lookup(f"8800{index:04d}", retry_delay=0)
+            check(len(bili._cache) <= 5, f"缓存条目被限制（实际 {len(bili._cache)}）")
+        finally:
+            bili.CACHE_MAX = original_max
+            bili.clear_cache()
+
+        # 11) 过期会话会被清掉
+        server.app.sessions["stale-token"] = {"csrf": "x", "created": time.time() - app_module.SESSION_TTL - 10, "ip": "1.1.1.1"}
+        check(server.app.get_session("stale-token") is None, "过期会话取不到")
+        check("stale-token" not in server.app.sessions, "过期会话被清出内存")
 
         print("\n[8] 前端资源结构")
         for name in ("apply.html", "login.html", "admin.html"):

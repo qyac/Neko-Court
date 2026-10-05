@@ -28,6 +28,7 @@ import threading
 import time
 import urllib.parse
 from http import HTTPStatus
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
@@ -35,13 +36,24 @@ import bili
 import render
 from store import STATUSES, Store
 
-SITE_VERSION = "1.0.0"
+def _site_version() -> str:
+    """站点版本：读同目录的 VERSION 文件（与发布包文件名同源，避免两处对不上）。"""
+    try:
+        return (Path(__file__).resolve().parent / "VERSION").read_text(encoding="utf-8").strip() or "v0.0.0"
+    except OSError:
+        return "v0.0.0"
+
+
+SITE_VERSION = _site_version()
 MAX_BODY_BYTES = 16 * 1024
 NOTE_MAX = 200
 PAGE_SIZE = 50
 SESSION_TTL = 12 * 3600
 LOGIN_MAX_FAILURES = 5
 LOGIN_LOCK_SECONDS = 60
+# 全局登录窗口：超过就整体暂停一会，避免攻击者换 IP 绕过单 IP 锁定
+LOGIN_GLOBAL_MAX = 60
+LOGIN_GLOBAL_WINDOW = 300.0
 RATE_WINDOW = 600.0
 STATIC_FILES = {
     "style.css": "text/css; charset=utf-8",
@@ -55,6 +67,8 @@ _SECURITY_HEADERS = {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
+    "Cross-Origin-Resource-Policy": "same-origin",
+    "Permissions-Policy": "geolocation=(), camera=(), microphone=(), payment=()",
     "Content-Security-Policy": (
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
         "script-src 'self' 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'"
@@ -63,6 +77,25 @@ _SECURITY_HEADERS = {
 
 
 # --------------------------------------------------------------------------- 密码与会话
+
+
+# Excel 会把以这些字符开头的单元格当公式执行（CSV 公式注入）
+_CSV_DANGEROUS_PREFIX = ("=", "+", "-", "@", "\t", "\r")
+
+
+def csv_safe(value: Any) -> str:
+    """防 CSV 公式注入。
+
+    B站 昵称与申请人备注都是**外部可控**内容，导出后管理员用 Excel 打开时
+    `=cmd|...` / `=HYPERLINK(...)` 这类单元格会被当公式执行，因此统一加前导单引号，
+    让 Excel 把它当纯文本。
+    """
+    if value is None:
+        return ""
+    text = str(value)
+    if text.startswith(_CSV_DANGEROUS_PREFIX):
+        return "'" + text
+    return text
 
 
 def hash_password(password: str, *, iterations: int = 200_000) -> str:
@@ -115,12 +148,16 @@ class RateLimiter:
 class App:
     """把配置、存储、限流、会话集中在一个对象里，便于测试直接构造。"""
 
-    def __init__(self, store: Store, *, admin_password_hash: str = ""):
+    def __init__(self, store: Store, *, admin_password_hash: str = "", trust_proxy: bool = False):
         self.store = store
+        # 只有部署在反向代理后面时才该打开（否则客户端可以伪造 IP）
+        self.trust_proxy = bool(trust_proxy)
         self.admin_password_hash = admin_password_hash or str(store.get_setting("admin_password_hash") or "")
         self.sessions: dict[str, dict[str, Any]] = {}
         self._session_lock = threading.Lock()
         self.login_limiter = RateLimiter(LOGIN_MAX_FAILURES, LOGIN_LOCK_SECONDS)
+        # 全局（不区分 IP）的登录尝试上限，缓解放大式撞库
+        self.login_global = RateLimiter(LOGIN_GLOBAL_MAX, LOGIN_GLOBAL_WINDOW)
         self.apply_limiter = RateLimiter(10, RATE_WINDOW)
         self.plugin_limiter = RateLimiter(120, 60.0)
 
@@ -146,9 +183,16 @@ class App:
         plugin_rules = data.get("plugin_rules") or {}
         if data.get("use_plugin_rules", True) and isinstance(plugin_rules, dict) and plugin_rules:
             merged = dict(own)
-            for key in ("bili_min_level", "bili_min_fans", "bili_name_keywords", "bili_unique"):
+            for key in ("bili_min_level", "bili_min_fans"):
                 if key in plugin_rules:
-                    merged[key] = plugin_rules[key]
+                    try:
+                        merged[key] = max(0, int(plugin_rules[key]))
+                    except (TypeError, ValueError):
+                        continue  # 脏数据忽略，用站点自己的值
+            if isinstance(plugin_rules.get("bili_name_keywords"), list):
+                merged["bili_name_keywords"] = [str(item) for item in plugin_rules["bili_name_keywords"]][:50]
+            if isinstance(plugin_rules.get("bili_unique"), bool):
+                merged["bili_unique"] = plugin_rules["bili_unique"]
             merged["source"] = "plugin"
             return merged
         own["source"] = "site"
@@ -167,6 +211,7 @@ class App:
         if not token:
             return None
         with self._session_lock:
+            self._sweep_locked()
             data = self.sessions.get(token)
             if not data:
                 return None
@@ -174,6 +219,20 @@ class App:
                 self.sessions.pop(token, None)
                 return None
             return dict(data)
+
+    def _sweep_locked(self) -> None:
+        """清掉过期会话（避免 sessions 字典无限增长）。调用方需持锁。"""
+        now = time.time()
+        for token in [k for k, v in self.sessions.items() if now - float(v.get("created") or 0) > SESSION_TTL]:
+            self.sessions.pop(token, None)
+
+    def drop_other_sessions(self, keep_token: str) -> int:
+        """改密码后把其它会话全部作废（否则泄露的旧 cookie 仍然有效）。"""
+        with self._session_lock:
+            victims = [token for token in self.sessions if token != keep_token]
+            for token in victims:
+                self.sessions.pop(token, None)
+            return len(victims)
 
     def drop_session(self, token: str) -> None:
         with self._session_lock:
@@ -191,10 +250,32 @@ class Handler(BaseHTTPRequestHandler):
 
     # ------------------------------------------------------------ 基础工具
 
+    @staticmethod
+    def _redact(text: str) -> str:
+        """日志脱敏：请求行里的查询串整段隐藏。
+
+        插件 token 允许放在 ?token= 里（兼容用），如果不脱敏就会整串写进日志文件；
+        统一隐藏查询串最省事，也不会漏掉以后新加的敏感参数。
+        """
+        line = str(text or "")
+        if "?" not in line:
+            return line
+        head, _, tail = line.partition("?")
+        version = ""
+        for suffix in (" HTTP/1.1", " HTTP/1.0", " HTTP/2.0", " HTTP/2"):
+            if tail.endswith(suffix):
+                version = suffix
+                break
+        return f"{head}?<已隐藏>{version}"
+
     def log_message(self, fmt: str, *args: Any) -> None:  # 收敛默认日志
         if os.environ.get("REVIEW_SITE_QUIET"):
             return
-        print(f"[{time.strftime('%H:%M:%S')}] {self.address_string()} {fmt % args}", flush=True)
+        try:
+            message = self._redact(fmt % args)
+        except Exception:
+            message = "(日志格式化失败)"
+        print(f"[{time.strftime('%H:%M:%S')}] {self._client_ip()} {message}", flush=True)
 
     @property
     def store(self) -> Store:
@@ -205,10 +286,27 @@ class Handler(BaseHTTPRequestHandler):
         return self.app.settings()
 
     def _client_ip(self) -> str:
-        forwarded = self.headers.get("X-Forwarded-For") or ""
-        if forwarded:
-            return forwarded.split(",")[0].strip()[:45]
+        """客户端 IP：默认**只用 TCP 源地址**。
+
+        `X-Forwarded-For` 是客户端可以随便伪造的头。如果无条件信任它：
+        · 攻击者每次换一个假 IP 就能绕过提交限流与登录锁定；
+        · 也能伪造成管理员的 IP，把真正的管理员锁在门外（锁定 DoS）。
+        只有部署时明确开了 `--trust-proxy`（确实有反代）才读它，并且取**最右**一项——
+        那是最靠近本站的代理写进去的地址，最左边的反而完全由客户端控制。
+        """
+        if self.app.trust_proxy:
+            forwarded = str(self.headers.get("X-Forwarded-For") or "")
+            parts = [item.strip() for item in forwarded.split(",") if item.strip()]
+            if parts:
+                return parts[-1][:45]
         return str(self.client_address[0])[:45]
+
+    def _is_https(self) -> bool:
+        """是否走 HTTPS（用于决定 Secure cookie / HSTS；反代场景看 X-Forwarded-Proto）。"""
+        proto = str(self.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+        if proto:
+            return proto == "https"
+        return bool(getattr(self.connection, "cipher", None))
 
     def _send(self, status: int, body: bytes, content_type: str, extra: dict[str, str] | None = None) -> None:
         self.send_response(status)
@@ -216,6 +314,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         for key, value in _SECURITY_HEADERS.items():
             self.send_header(key, value)
+        if self._is_https():
+            # 只有确认走加密通道时才发 HSTS，避免把纯 HTTP 部署搞坏
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -224,25 +325,47 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, status: int, payload: dict[str, Any], extra: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self._send(status, body, "application/json; charset=utf-8", extra)
+        headers = {"Cache-Control": "no-store"}
+        headers.update(extra or {})
+        self._send(status, body, "application/json; charset=utf-8", headers)
 
     def _html(self, status: int, text: str, extra: dict[str, str] | None = None) -> None:
-        self._send(status, text.encode("utf-8"), "text/html; charset=utf-8", extra)
+        # 结果页里可能有验证码，绝不能被浏览器或中间缓存留下来
+        headers = {"Cache-Control": "no-store"}
+        headers.update(extra or {})
+        self._send(status, text.encode("utf-8"), "text/html; charset=utf-8", headers)
 
     def _error(self, status: int, message: str) -> None:
         self._json(status, {"ok": False, "error": message})
 
-    def _body(self) -> dict[str, Any]:
-        """读取请求体：支持 JSON 与表单编码。"""
+    def _read_raw_body(self) -> bytes:
+        """把请求体一次性读完（超限就丢弃并关闭连接）。
+
+        这一步很关键：如果只读一半就直接回响应，keep-alive 连接上残留的字节会被当成
+        **下一个请求**解析（HTTP 请求错位 / 请求走私）。所以要么读完，要么丢弃并关连接。
+        """
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         if length <= 0:
-            return {}
+            return b""
         if length > MAX_BODY_BYTES:
+            remaining = length
+            while remaining > 0:
+                chunk = self.rfile.read(min(65536, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+            self.close_connection = True  # 不再复用这条连接
             raise ValueError("请求体过大")
-        raw = self.rfile.read(length)
+        return self.rfile.read(length)
+
+    def _body(self) -> dict[str, Any]:
+        """解析已读入的请求体：支持 JSON 与表单编码。"""
+        raw = getattr(self, "_raw_body", b"") or b""
+        if not raw:
+            return {}
         content_type = (self.headers.get("Content-Type") or "").lower()
         if "application/json" in content_type:
             try:
@@ -271,6 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            self._raw_body = self._read_raw_body()  # GET 一般没有 body，有也要读完
             if path == "/":
                 return self._page_apply()
             if path == "/admin":
@@ -299,14 +423,19 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             return
         except Exception as exc:  # 兜底：不让异常打死连接
-            self.log_message("处理 GET %s 出错：%s", self.path, exc)
-            return self._error(500, f"服务器内部错误：{exc}")
+            ref = secrets.token_hex(4)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 处理 GET {self._redact(self.path)} 出错（错误编号 {ref}）：{exc!r}",
+                flush=True,
+            )
+            return self._error(500, f"服务器内部错误，请稍后重试（错误编号 {ref}）")
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = urllib.parse.parse_qs(parsed.query)
         try:
+            self._raw_body = self._read_raw_body()
             if path == "/api/apply":
                 return self._api_apply()
             if path == "/api/admin/login":
@@ -331,8 +460,12 @@ class Handler(BaseHTTPRequestHandler):
         except BrokenPipeError:
             return
         except Exception as exc:
-            self.log_message("处理 POST %s 出错：%s", self.path, exc)
-            return self._error(500, f"服务器内部错误：{exc}")
+            ref = secrets.token_hex(4)
+            print(
+                f"[{time.strftime('%H:%M:%S')}] 处理 POST {self._redact(self.path)} 出错（错误编号 {ref}）：{exc!r}",
+                flush=True,
+            )
+            return self._error(500, f"服务器内部错误，请稍后重试（错误编号 {ref}）")
 
     # ------------------------------------------------------------ 页面
 
@@ -539,7 +672,8 @@ class Handler(BaseHTTPRequestHandler):
         return ""
 
     def _session_cookie(self, token: str, *, max_age: int) -> str:
-        return f"review_admin={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={int(max_age)}"
+        secure = "; Secure" if self._is_https() else ""
+        return f"review_admin={token}; Path=/; HttpOnly; SameSite=Lax{secure}; Max-Age={int(max_age)}"
 
     def _session(self) -> dict[str, Any] | None:
         return self.app.get_session(self._token())
@@ -562,6 +696,9 @@ class Handler(BaseHTTPRequestHandler):
         ip = self._client_ip()
         if not self.app.login_limiter.hit(f"login:{ip}"):
             return self._error(429, f"密码错误次数过多，请 {LOGIN_LOCK_SECONDS} 秒后再试")
+        # 全局阈值：换 IP 也挡得住（撞库通常来自一大片地址）
+        if not self.app.login_global.hit("global"):
+            return self._error(429, "登录尝试过于频繁，请稍后再试")
         payload = self._body()
         password = str(payload.get("password") or "")
         stored = self.app.admin_password_hash or str(self.store.get_setting("admin_password_hash") or "")
@@ -644,6 +781,20 @@ class Handler(BaseHTTPRequestHandler):
             },
         )
 
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """把任意脏输入转成整数（列表/字典/非数字都给默认值，不抛异常）。"""
+        if isinstance(value, bool):
+            return int(value)
+        if isinstance(value, (int, float)):
+            return int(value)
+        if isinstance(value, str):
+            try:
+                return int(float(value.strip() or default))
+            except ValueError:
+                return default
+        return default
+
     def _api_admin_save_settings(self) -> None:
         payload = self._body()
         session = self._require_admin(csrf=str(payload.get("csrf") or ""))
@@ -654,9 +805,15 @@ class Handler(BaseHTTPRequestHandler):
             if key in payload:
                 self.store.set_setting(key, str(payload.get(key) or "")[:200])
         if "bili_min_level" in payload:
-            self.store.set_setting("bili_min_level", max(0, min(6, int(payload.get("bili_min_level") or 0))))
+            raw_level = payload.get("bili_min_level")
+            if isinstance(raw_level, (list, dict)):
+                return self._error(400, "最低等级必须是数字")
+            self.store.set_setting("bili_min_level", max(0, min(6, self._safe_int(raw_level))))
         if "bili_min_fans" in payload:
-            self.store.set_setting("bili_min_fans", max(0, int(payload.get("bili_min_fans") or 0)))
+            raw_fans = payload.get("bili_min_fans")
+            if isinstance(raw_fans, (list, dict)):
+                return self._error(400, "最低粉丝数必须是数字")
+            self.store.set_setting("bili_min_fans", max(0, self._safe_int(raw_fans)))
         if "bili_name_keywords" in payload:
             raw = payload.get("bili_name_keywords")
             if isinstance(raw, str):
@@ -678,7 +835,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(400, "管理员密码至少 8 位")
             self.store.set_setting("admin_password_hash", hash_password(password))
             self.app.admin_password_hash = str(self.store.get_setting("admin_password_hash"))
-            self.store.log("password_changed", actor="admin", detail="")
+            # 改密码通常意味着怀疑泄露：把其它会话全部踢掉（保留当前这个）
+            revoked = self.app.drop_other_sessions(self._token())
+            self.store.log("password_changed", actor="admin", detail=f"revoked_sessions={revoked}")
         if payload.get("plugin_token"):
             token = str(payload["plugin_token"]).strip()
             if len(token) < 16:
@@ -754,7 +913,7 @@ class Handler(BaseHTTPRequestHandler):
                     row.get("ticket"),
                     row.get("qq"),
                     row.get("uid"),
-                    row.get("uid_name"),
+                    csv_safe(row.get("uid_name")),
                     row.get("level"),
                     row.get("fans"),
                     row.get("status"),
@@ -764,7 +923,7 @@ class Handler(BaseHTTPRequestHandler):
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row.get("created_at") or 0))),
                     time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(row["decided_at"]))) if row.get("decided_at") else "",
                     row.get("delivered"),
-                    row.get("note"),
+                    csv_safe(row.get("note")),
                 ]
             )
         body = ("\ufeff" + buffer.getvalue()).encode("utf-8")  # BOM 让 Excel 正确识别 UTF-8
@@ -889,10 +1048,11 @@ def make_server(
     port: int,
     store: Store,
     admin_password_hash: str = "",
+    trust_proxy: bool = False,
     handler_cls: type[Handler] | None = None,
 ) -> ThreadingHTTPServer:
     """构造服务器（测试里可以直接用它起在 127.0.0.1:0）。"""
-    app = App(store, admin_password_hash=admin_password_hash)
+    app = App(store, admin_password_hash=admin_password_hash, trust_proxy=trust_proxy)
     cls = handler_cls or Handler
 
     class BoundHandler(cls):  # type: ignore[misc, valid-type]

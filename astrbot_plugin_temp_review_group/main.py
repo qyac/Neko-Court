@@ -58,7 +58,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.5"
+PLUGIN_VERSION = "v1.1.6"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -922,7 +922,12 @@ class TempReviewGroup(Star):
     # ------------------------------------------------------------------ 网页审核对接
 
     def _web_review_url(self) -> str:
-        return str(self._get("web_review_url", "") or "").strip().rstrip("/")
+        url = str(self._get("web_review_url", "") or "").strip().rstrip("/")
+        # 只允许 http/https：避免配置里塞 file:// 之类被 urllib 当本地文件读
+        if url and not url.lower().startswith(("http://", "https://")):
+            logger.warning("[审核群] web_review_url 必须是 http(s) 地址，当前值已忽略：%s", url[:60])
+            return ""
+        return url
 
     def _web_review_token(self) -> str:
         return str(self._get("web_review_token", "") or "").strip()
@@ -1038,11 +1043,13 @@ class TempReviewGroup(Star):
         if not self._web_review_enabled():
             return 0, "未启用"
         base = self._web_review_url()
-        token = urllib.parse.quote(self._web_review_token())
+        # token 走请求头，不放进 URL（URL 会进浏览器历史/反代与站点日志）
+        auth = {"X-Review-Token": self._web_review_token()}
         try:
             data = await self._http_json(
                 "GET",
-                f"{base}/api/plugin/applications?status=approved&limit={WEB_REVIEW_PULL_LIMIT}&token={token}",
+                f"{base}/api/plugin/applications?status=approved&limit={WEB_REVIEW_PULL_LIMIT}",
+                headers=auth,
             )
         except Exception as exc:
             return 0, f"拉取失败：{exc}"
@@ -1096,6 +1103,7 @@ class TempReviewGroup(Star):
             await self._http_json(
                 "POST",
                 f"{base}/api/plugin/ack",
+                headers=auth,
                 payload={"token": self._web_review_token(), "ids": acked},
             )
         except Exception as exc:
