@@ -234,10 +234,10 @@
 | `kick_on_fail` | bool | `true` | 答错次数用尽后移出 |
 | `reject_add_request` | bool | `false` | 踢人时同时拒绝再次加群（清理与审核失败都生效） |
 | `auto_enroll_on_speak` | bool | `true` | 补发问题（不消耗次数） |
-| `question_message` | text | 见配置页 | 占位符 `{user}` `{question}` `{max_attempts}` |
-| `retry_message` | text | 见配置页 | 占位符 `{user}` `{remaining}` `{max_attempts}` |
-| `success_message` | text | 见配置页 | 占位符 `{user}` `{code}` `{expire}` |
-| `kick_message` | text | 见配置页 | 占位符 `{user}` `{max_attempts}` |
+| `question_message` | text | 见配置页 | 占位符 `{at}` `{user}` `{question}` `{max_attempts}` |
+| `retry_message` | text | 见配置页 | 占位符 `{at}` `{user}` `{remaining}` `{max_attempts}` |
+| `success_message` | text | 见配置页 | 占位符 `{at}` `{user}` `{code}` `{expire}` |
+| `kick_message` | text | 见配置页 | 占位符 `{user}` `{max_attempts}`（踢人提示默认不 @，需要就在模板里加 `{at}`） |
 | `code_send_mode` | string | `private` | `private` / `group` / `both`，见上文 |
 | `private_code_message` | text | 见配置页 | 私聊发码文案，占位符 `{code}` `{expire}` `{user}` `{group}` |
 | `code_fallback_to_group` | bool | `false` | 私聊失败时是否改为群内发码兜底 |
@@ -277,7 +277,7 @@
 
 仓库根目录有三个自检脚本，都只用标准库、不依赖 AstrBot 本体：
 
-1. `selftest_temp_review_group.py`（Python）用桩模块替换 `astrbot.*`，直接导入本插件的 `main.py`，覆盖答案匹配、验证码生成、时间解析、入群提问、答错踢出、答对发码、指令消息不误判、每日清理（含白名单与保留已通过）、状态持久化、权限判定、主动发送、查询/设定/重置验证码与放行/补发、重审、踢出、清理等全部管理指令，**LLM 审核**（PASS/FAIL 解析、否定词优先、超时/报错/无 Provider/提供商不存在时的规则回退、hybrid 省额度、提示词占位符），**发码渠道**（private/group/both、群临时会话 `send_private_msg`、auto/temp_session/friend 三种通道、临时会话失败退回好友、私聊失败回退群内、文案缺 `{code}` 自动补码），**排查能力**（群通知/入群/退群/非配置群/群消息事件计数、跳过原因、发送失败计数、重复入群重新提问、`/审核 诊断` 结论与群内发送自检），**问题库/答案库**（停用题目不参与抽题、单题匹配方式覆盖全局、fuzzy 相似度与阈值边界、通用答案库、题干快照进记录、该题提示自动附加、抽中/通过统计与不被每日清理清掉、`/审核 题库` 与 `/审核 试答` 的输出与"不改动记录"特性），以及 **WebUI 后端 API**（GET/POST 契约、类型与范围校验、各类拒绝路径、保存失败处理）和 Pages 资源结构，共 **300 项断言**：
+1. `selftest_temp_review_group.py`（Python）用桩模块替换 `astrbot.*`，直接导入本插件的 `main.py`，覆盖答案匹配、验证码生成、时间解析、入群提问、答错踢出、答对发码、指令消息不误判、每日清理（含白名单与保留已通过）、状态持久化、权限判定、主动发送、查询/设定/重置验证码与放行/补发、重审、踢出、清理等全部管理指令，**LLM 审核**（PASS/FAIL 解析、否定词优先、超时/报错/无 Provider/提供商不存在时的规则回退、hybrid 省额度、提示词占位符），**发码渠道**（private/group/both、群临时会话 `send_private_msg`、auto/temp_session/friend 三种通道、临时会话失败退回好友、私聊失败回退群内、文案缺 `{code}` 自动补码），**排查能力**（群通知/入群/退群/非配置群/群消息事件计数、跳过原因、发送失败计数、重复入群重新提问、`/审核 诊断` 结论与群内发送自检），**问题库/答案库**（停用题目不参与抽题、单题匹配方式覆盖全局、fuzzy 相似度与阈值边界、通用答案库、题干快照进记录、该题提示自动附加、抽中/通过统计与不被每日清理清掉、`/审核 题库` 与 `/审核 试答` 的输出与"不改动记录"特性），以及 **WebUI 后端 API**（GET/POST 契约、类型与范围校验、各类拒绝路径、保存失败处理）和 Pages 资源结构，共 **312 项断言**：
 
    ```bash
    python selftest_temp_review_group.py

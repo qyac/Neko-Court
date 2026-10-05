@@ -208,25 +208,25 @@
   "question_message": {
     "type": "text",
     "description": "提问文案",
-    "hint": "可用占位符：{user} 昵称、{question} 问题、{max_attempts} 允许答错次数。",
-    "default": "欢迎加入！请回答下面的问题完成审核：\n\n{question}\n\n（共 {max_attempts} 次机会，答错将被移出本群）"
+    "hint": "可用占位符：{at} 提及新人（放在开头即 @ 新人，也可放到句中）、{user} 昵称、{question} 问题、{max_attempts} 允许答错次数。",
+    "default": "{at} 欢迎加入！请回答下面的问题：\n\n{question}\n\n（共 {max_attempts} 次机会，答错将被移出本群）"
   },
   "retry_message": {
     "type": "text",
     "description": "答错提示",
-    "hint": "可用占位符：{user}、{remaining} 剩余次数、{max_attempts}。",
-    "default": "回答不正确，请再试一次。你还有 {remaining} 次机会。"
+    "hint": "可用占位符：{at} 提及该成员、{user}、{remaining} 剩余次数、{max_attempts}。",
+    "default": "{at} 回答不正确，请再试一次。你还有 {remaining} 次机会。"
   },
   "success_message": {
     "type": "text",
     "description": "通过提示（群内）",
-    "hint": "可用占位符：{user}、{code} 当日验证码、{expire} 失效时间、{group} 群号。默认不含 {code}（验证码走私聊）。若 code_send_mode 包含群内发码，请自行加上 {code}；没加也不会漏码——发码时会自动补一行「（验证码：xxx）」。",
-    "default": "审核通过！验证码已私聊发送，请注意查收（有效期至 {expire}）。\n若未收到，请先添加机器人为好友，或联系管理员补发。"
+    "hint": "可用占位符：{at} 提及该成员、{user}、{code} 当日验证码、{expire} 失效时间、{group} 群号。默认不含 {code}（验证码走私聊）。若 code_send_mode 包含群内发码，请自行加上 {code}；没加也不会漏码——发码时会自动补一行「（验证码：xxx）」。",
+    "default": "{at} 审核通过！验证码已私聊发送，请注意查收（有效期至 {expire}）。\n若未收到，请先添加机器人为好友，或联系管理员补发。"
   },
   "kick_message": {
     "type": "text",
     "description": "审核失败提示",
-    "hint": "可用占位符：{user} 昵称、{max_attempts}。",
+    "hint": "可用占位符：{user} 昵称、{max_attempts}；想在踢人提示里也 @ 他，就自己加上 {at}（默认不 @，因为人已经不在群里了）。",
     "default": "{user} 未通过审核，已移出本群。"
   },
   "code_length": {

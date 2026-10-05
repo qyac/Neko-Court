@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.1"
+PLUGIN_VERSION = "v1.1.2"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -1022,7 +1022,7 @@ class TempReviewGroup(Star):
                 remaining=plan.get("remaining", 0),
                 max_attempts=self._max_attempts(),
             )
-            await self._send_event_chain(event, [At(qq=user_id, name=""), Plain(f" {text_out}")])
+            await self._send_event_chain(event, self._mention_components(text_out, user_id))
             logger.info("[审核群] 成员 %s（群 %s）判定为未通过（%s），剩余 %s 次机会。", user_id, group_id, source_label, plan.get("remaining"))
         elif action == "pass":
             code = str(plan.get("code") or "")
@@ -1051,7 +1051,7 @@ class TempReviewGroup(Star):
                 user=user_name,
                 max_attempts=self._max_attempts(),
             )
-            await self._send_event_chain(event, [Plain(kick_text)])
+            await self._send_event_chain(event, self._mention_components(kick_text, user_id, default_mention=False))
             logger.info(
                 "[审核群] 成员 %s 在群 %s 审核失败（%s 次，判定来源：%s），%s。",
                 user_id,
@@ -1230,7 +1230,7 @@ class TempReviewGroup(Star):
                     "验证码会出现在群里。请把 success_message 里的 {code} 删掉。",
                     mode,
                 )
-            await self._send_to_group(group_id, components=[At(qq=user_id, name=""), Plain(f" {group_text}")])
+            await self._send_to_group(group_id, components=self._mention_components(group_text, user_id))
 
         if not group_id and not result["private"]:
             logger.warning("[审核群] 无群号且私聊失败，验证码未能送达用户 %s。", user_id)
@@ -1247,7 +1247,7 @@ class TempReviewGroup(Star):
         if hint and hint not in text:
             # 该题配了提示但文案里没写 {hint}：直接附一行，避免"配了不生效"
             text = f"{text}\n提示：{hint}"
-        sent = await self._send_event_chain(event, [At(qq=user_id, name=""), Plain(f" {text}")])
+        sent = await self._send_event_chain(event, self._mention_components(text, user_id))
         if sent:
             self._diag_bump("asked")
             self._diag["last_question"] = {
@@ -1707,7 +1707,7 @@ class TempReviewGroup(Star):
                 question=str(question.get("question") or ""),
                 max_attempts=self._max_attempts(),
             )
-            await self._send_to_group(group_id, components=[At(qq=user_id, name=""), Plain(f" {text}")])
+            await self._send_to_group(group_id, components=self._mention_components(text, user_id))
             yield event.plain_result(f"🔁 已重置 QQ {user_id} 的审核记录并重新提问（群 {group_id}）。")
         elif question is None:
             yield event.plain_result("⚠️ 未配置可用的审核问题（questions/answers），无法重新提问。")
@@ -2626,6 +2626,28 @@ class TempReviewGroup(Star):
         return False
 
     # ------------------------------------------------------------------ 发送辅助
+
+    @staticmethod
+    def _mention_components(text: str, user_id: str, default_mention: bool = True) -> list[Any]:
+        """把文案里的 {at} 换成真实的 @ 组件。
+
+        - 文案里有 {at}：在对应位置插入 @（可以放中间、也可以放多处）；紧跟其后的一个空格会被
+          吃掉，避免与协议端自动补的分隔空格叠加成两个空格；
+        - 文案里没有 {at}：default_mention 为真时前置一个 @（保持既有行为）；
+          为假时原样发送（例如踢人提示，人已被移出群，不再 @）。
+        """
+        text = str(text or "")
+        if "{at}" in text:
+            components: list[Any] = []
+            for index, part in enumerate(text.split("{at}")):
+                if index:
+                    components.append(At(qq=user_id, name=""))
+                if part:
+                    components.append(Plain(part[1:] if index and part.startswith(" ") else part))
+            return components
+        if not default_mention:
+            return [Plain(text)] if text else []
+        return [At(qq=user_id, name=""), Plain(text)] if text else [At(qq=user_id, name="")]
 
     async def _send_event_chain(self, event: AstrMessageEvent, components: list[Any]) -> bool:
         try:

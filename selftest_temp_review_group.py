@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.1",
+            version="v1.1.2",
             desc="自检用元数据",
         )
 
@@ -481,6 +481,25 @@ def texts_of(bucket):
     return [chain_text(item[1] if isinstance(item, tuple) else item) for item in bucket]
 
 
+def chains_of(bucket):
+    """取出消息链列表（事件回复与 (umo, chain) 两种形式都支持）。"""
+    out = []
+    for item in bucket:
+        chain = item[1] if isinstance(item, tuple) else item
+        out.append(list(getattr(chain, "chain", chain)))
+    return out
+
+
+def mentions_of(bucket):
+    """取出所有 @ 的目标 QQ，用于断言"真的 @ 到了新人"。"""
+    targets = []
+    for chain in chains_of(bucket):
+        for component in chain:
+            if type(component).__name__ == "At":
+                targets.append(str(getattr(component, "qq", "")))
+    return targets
+
+
 # --------------------------------------------------------------------------- 用例
 
 
@@ -571,6 +590,10 @@ async def main():
             "临时会话指向正确的群与成员",
         )
         check(group_notices and all(current_code not in text for text in group_notices), "群内通过提示不含验证码")
+        check(
+            "10002" in mentions_of(context.sent),
+            f"通过提示 @ 到了该成员（实际 {mentions_of(context.sent)}）",
+        )
         check(not module._has_command_handler(right), "普通消息不会被视为指令")
 
         print("\n[4] 指令消息不被当作答案")
@@ -1491,7 +1514,68 @@ async def main():
         resp = await plugin.api_parse_questions()
         check(resp["status_code"] == 400, "空文本被拒绝")
 
-        print("\n[18] Pages 资源结构")
+        print("\n[19] @ 提到新人（{at} 占位符）")
+        reset_review(review_mode="rule", code_send_mode="private", private_send_channel="auto")
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "1+1=?", "hint": "", "answers": ["2"], "match_mode": "inherit"}
+        ]
+        plugin.config["question_message"] = "欢迎加入！请回答：{question}"
+        plugin.config["retry_message"] = "答错了，还剩 {remaining} 次"
+        plugin.config["success_message"] = "审核通过！"
+        plugin.config["kick_message"] = "{user} 未通过审核"
+
+        # 1) 文案里没写 {at}，也要默认 @ 新人（提问 / 答错 / 通过三条路径）
+        ask_event = FakeEvent(post_type="notice", notice_type="group_increase", user_id="60001")
+        await plugin.on_group_notice(ask_event)
+        check(
+            mentions_of(ask_event.sent)[:1] == ["60001"],
+            f"没写 {{at}} 也默认在最前面 @ 新人（{mentions_of(ask_event.sent)}）",
+        )
+        wrong = FakeEvent(user_id="60001", text="不知道")
+        await plugin.on_group_message(wrong)
+        check("60001" in mentions_of(wrong.sent), "答错重试提示也 @ 到本人")
+        context.sent.clear()
+        await plugin.on_group_message(FakeEvent(user_id="60001", text="2"))
+        check("60001" in mentions_of(context.sent), "通过提示也 @ 到本人")
+
+        # 2) {at} 可以放句中，位置精确
+        plugin.config["question_message"] = "同学 {at} 你好，请回答：{question}"
+        ask2 = FakeEvent(post_type="notice", notice_type="group_increase", user_id="60002")
+        await plugin.on_group_notice(ask2)
+        chain = chains_of(ask2.sent)[0]
+        kinds = [type(component).__name__ for component in chain]
+        check(kinds[:3] == ["Plain", "At", "Plain"], f"{{at}} 放句中时按位置插入 @（{kinds}）")
+        check(chain[0].text.rstrip() == "同学", "句中 {at} 之前的文本保持原样（空格是模板里写的，会保留）")
+        check(str(chain[1].qq) == "60002", "句中 {at} 指向新人")
+        check(
+            chain[2].text.startswith("你好"),
+            f"{{at}} 后面多写的那个空格被吃掉（{chain[2].text!r}）",
+        )
+
+        # 3) 文案里可以出现多个 {at}
+        plugin.config["question_message"] = "{at} 请回答：{question}（{at} 记得答完哦）"
+        ask3 = FakeEvent(post_type="notice", notice_type="group_increase", user_id="60003")
+        await plugin.on_group_notice(ask3)
+        check(mentions_of(ask3.sent) == ["60003", "60003"], "多处 {at} 会插入多个 @")
+
+        # 4) 踢人提示：默认不 @（人已移出群），模板写了 {at} 才 @
+        plugin.config["question_message"] = "{at} 请回答：{question}"
+        plugin.config["max_attempts"] = 1
+        await plugin.on_group_notice(FakeEvent(post_type="notice", notice_type="group_increase", user_id="60004"))
+        kick_default = FakeEvent(user_id="60004", text="错的")
+        await plugin.on_group_message(kick_default)
+        check(mentions_of(kick_default.sent) == [], "踢人提示默认不 @")
+        check("123456:60004" not in plugin._state["pending"], "（前置）达到答错上限已踢出")
+
+        plugin.config["kick_message"] = "{at} {user} 未通过审核"
+        await plugin.on_group_notice(FakeEvent(post_type="notice", notice_type="group_increase", user_id="60005"))
+        kick_at = FakeEvent(user_id="60005", text="错的")
+        await plugin.on_group_message(kick_at)
+        check(mentions_of(kick_at.sent) == ["60005"], "模板里写了 {at} 时踢人提示也会 @")
+        plugin.config["max_attempts"] = 3
+        plugin.config["kick_message"] = "{user} 未通过审核"
+
+        print("\n[20] Pages 资源结构")
         pages = {
             "settings": ("index.html", "app.js", "settings.js", "style.css"),
             "questions": ("index.html", "app.js", "bank.js", "style.css"),
