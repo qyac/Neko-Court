@@ -28,6 +28,13 @@ WORKSPACE = Path(__file__).resolve().parent.parent
 DEFAULT_PLUGIN_DIR = WORKSPACE / "astrbot_plugin_temp_review_group"
 DEFAULT_OUT_DIR = WORKSPACE / "dist"
 
+# Windows 控制台常是 GBK，直接 print "✓" 会抛 UnicodeEncodeError；强制切 UTF-8（失败也不影响功能）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:
+        pass
+
 EXCLUDE_DIRS = {
     "__pycache__",
     ".git",

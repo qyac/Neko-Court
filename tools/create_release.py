@@ -35,6 +35,13 @@ API = "https://api.github.com"
 UPLOADS = "https://uploads.github.com"
 USER_AGENT = "neko-court-release-script"
 
+# Windows 控制台常是 GBK，直接 print "✓" 会抛 UnicodeEncodeError；强制切 UTF-8（失败也不影响功能）。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+    except Exception:
+        pass
+
 
 def api_request(
     method: str,
