@@ -246,6 +246,68 @@
     "hint": "可用占位符：{user} 昵称、{max_attempts}；想在踢人提示里也 @ 他，就自己加上 {at}（默认不 @，因为人已经不在群里了）。",
     "default": "{user} 未通过审核，已移出本群。"
   },
+  "bili_uid_enabled": {
+    "type": "bool",
+    "description": "启用 B站 UID 审核",
+    "hint": "开启后，成员的回答必须是（含）他的 B站 UID，插件会去 B站核验账号信息；核验通过才算通过，答案库与大模型不再参与判定。",
+    "default": false
+  },
+  "bili_uid_prompt": {
+    "type": "text",
+    "description": "索取 UID 的提示",
+    "hint": "开启 UID 审核时，若提问文案里没提到 UID，会自动附上这句。留空表示不附。",
+    "default": "请把你的 B站 UID 发给我（纯数字，例如 12345678；也可以直接发你的 B站主页链接）"
+  },
+  "bili_uid_min_level": {
+    "type": "int",
+    "description": "要求的最低 B站等级",
+    "hint": "0 表示不检查。B站等级范围 0~6。",
+    "default": 0,
+    "slider": {
+      "min": 0,
+      "max": 6,
+      "step": 1
+    }
+  },
+  "bili_uid_min_fans": {
+    "type": "int",
+    "description": "要求的最低粉丝数",
+    "hint": "0 表示不检查。注意：粉丝数不是判断真人的可靠指标，按需使用。",
+    "default": 0
+  },
+  "bili_uid_name_keywords": {
+    "type": "list",
+    "description": "昵称必须包含的关键词",
+    "hint": "留空表示不检查；填了则要求 B站昵称包含其中任意一个（常用于要求成员先改昵称）。",
+    "default": []
+  },
+  "bili_uid_unique": {
+    "type": "bool",
+    "description": "一个 UID 只能绑一个 QQ",
+    "hint": "开启后会记录 UID↔QQ 绑定，别的 QQ 再用同一个 UID 会被拒绝（防一码多用）。绑定记录会持久化，可用「/审核 解绑 <UID>」清除。",
+    "default": true
+  },
+  "bili_uid_on_error": {
+    "type": "string",
+    "description": "查不到时怎么办",
+    "hint": "reject：接口被风控/网络失败时判为不通过（默认，严谨）；pass：判为通过（避免 B站 风控挡住真实成员，但会放宽审核）。账号确实不存在（-404）时无论选哪个都判不通过。",
+    "options": [
+      "reject",
+      "pass"
+    ],
+    "default": "reject"
+  },
+  "bili_uid_timeout_seconds": {
+    "type": "float",
+    "description": "B站接口超时（秒）",
+    "hint": "单次查询超时；超时会自动重试一次（风控场景）。",
+    "default": 10.0,
+    "slider": {
+      "min": 3.0,
+      "max": 30.0,
+      "step": 1.0
+    }
+  },
   "code_length": {
     "type": "int",
     "description": "验证码长度",

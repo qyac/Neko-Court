@@ -37,6 +37,20 @@ export const FIELD_GROUPS = [
     ],
   },
   {
+    id: "bili",
+    title: "B站 UID 审核",
+    keys: [
+      "bili_uid_enabled",
+      "bili_uid_prompt",
+      "bili_uid_min_level",
+      "bili_uid_min_fans",
+      "bili_uid_name_keywords",
+      "bili_uid_unique",
+      "bili_uid_on_error",
+      "bili_uid_timeout_seconds",
+    ],
+  },
+  {
     id: "code",
     title: "验证码",
     keys: [

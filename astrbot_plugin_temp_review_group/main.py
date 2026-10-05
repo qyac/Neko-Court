@@ -30,6 +30,7 @@ import re
 import secrets
 import time
 import unicodedata
+import urllib.request
 from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.3"
+PLUGIN_VERSION = "v1.1.4"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -93,6 +94,22 @@ MATCH_MODES = ("contains", "exact", "regex", "fuzzy")
 MATCH_MODE_CHOICES = ("inherit",) + MATCH_MODES
 # 入群消息组合方式：merge = 欢迎语与问题合成一条；separate = 先欢迎语再问题；question_only = 只发问题
 JOIN_MESSAGE_MODES = ("merge", "separate", "question_only")
+# B站 UID 审核：查询接口与请求头（不带 UA/Referer 容易被风控）
+BILI_CARD_API = "https://api.bilibili.com/x/web-interface/card"
+BILI_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
+)
+# 查询不到时的处理：reject = 当作答错；pass = 放行（例如接口被风控时不想卡住成员）
+BILI_ON_ERROR_CHOICES = ("reject", "pass")
+# 这些返回码代表"账号确实不存在"，要与风控/网络错误区分开
+BILI_NOT_FOUND_CODES = {-400, -404, 62002}
+BILI_CACHE_TTL = 600.0
+# 被风控时的重试等待（自检里会调成 0）
+BILI_RETRY_DELAY = 1.0
+_BILI_UID_IN_URL_RE = re.compile(r"(?:space\.bilibili\.com|bilibili\.com/space)/(\d{1,10})", re.I)
+_BILI_UID_LABELED_RE = re.compile(r"(?:uid|Uid|UID)\s*[:：=]?\s*(\d{1,10})")
+_BILI_UID_BARE_RE = re.compile(r"(?<!\d)(\d{2,10})(?!\d)")
 # LLM 审核：系统提示词固定，要求模型只回一个判定词
 LLM_JUDGE_SYSTEM_PROMPT = (
     "你是入群审核判定器。根据审核问题、参考答案和申请人的回答，判断申请人是否通过。"
@@ -155,6 +172,8 @@ HELP_TEXT = """📖 临时审核群管理
 · /审核 题库        查看问题库/答案库（含抽中与通过统计）
 · /审核 试答 [#题号] <回答>  先验证这句话会不会通过，再调答案库
 · /审核 诊断        排查「新人入群没收到消息」：事件计数、配置、发送自检
+· /审核 查UID <UID> 查询 B站 UID 的昵称/等级/粉丝、是否满足规则、绑定情况
+· /审核 解绑 <UID>  清除 UID↔QQ 绑定（解除「一个 UID 只能绑一个 QQ」的限制）
 · /审核 重置码      立即重新生成验证码
 · /审核 设定码 <码> 手动设定验证码
 · /审核 放行 <QQ> [群号]   手动放行并下发验证码
@@ -235,6 +254,7 @@ class TempReviewGroup(Star):
         self._schema_cache: dict[str, Any] | None = None
         self._group_code_notice_logged = False
         self._private_leak_warned = False
+        self._bili_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         # 运行期诊断信息（不落盘，重载后清零）：用于回答"为什么没给新人发消息"
         self._diag: dict[str, Any] = {
             "counters": {},
@@ -363,6 +383,7 @@ class TempReviewGroup(Star):
             "pending": {},
             "approved": {},
             "question_stats": {},
+            "bili_uids": {},
             "group_platform": {},
             "self_ids": [],
         }
@@ -956,8 +977,9 @@ class TempReviewGroup(Star):
                 "hint": str(record.get("hint") or ""),
             }
 
-        # 判定放在锁外：LLM 审核是一次网络请求，不能占着状态锁阻塞其它成员的消息
-        passed, source = await self._judge_text(event, group_id, user_id, entry, text)
+        # 判定放在锁外：LLM/B站查询都是网络请求，不能占着状态锁阻塞其它成员的消息
+        passed, source, judge_extra = await self._judge_text(event, group_id, user_id, entry, text)
+        bili_info = judge_extra.get("bili") if isinstance(judge_extra, dict) else None
 
         plan: dict[str, Any] = {}
         async with self._lock:
@@ -977,7 +999,11 @@ class TempReviewGroup(Star):
                     "code": code,
                     "platform_id": str(record.get("platform_id") or ""),
                     "question": str(record.get("question") or ""),
+                    "bili_uid": str((bili_info or {}).get("uid") or ""),
+                    "bili_name": str((bili_info or {}).get("name") or ""),
                 }
+                if isinstance(bili_info, dict) and bili_info.get("uid"):
+                    self._bili_bind(bili_info["uid"], user_id, str(bili_info.get("name") or ""), group_id)
                 self._bump_question_stat(str(record.get("question") or ""), "passes")
                 self._save_state()
                 plan = {
@@ -1018,12 +1044,18 @@ class TempReviewGroup(Star):
             }
             await self._ask_question(event, user_id, question, "补发问题")
         elif action == "retry":
+            retry_template = self._template("retry_message")
+            reason = str(plan.get("source") or "").strip()
             text_out = self._render(
-                self._template("retry_message"),
+                retry_template,
                 user=user_name,
                 remaining=plan.get("remaining", 0),
                 max_attempts=self._max_attempts(),
+                reason=reason,
             )
+            # UID 审核是确定性判定，必须让成员知道差在哪（模板里已写 {reason} 就不重复）
+            if reason and self._bili_enabled() and "{reason}" not in retry_template and "原因" not in text_out:
+                text_out = f"{text_out}\n原因：{reason}"
             await self._send_event_chain(event, self._mention_components(text_out, user_id))
             logger.info("[审核群] 成员 %s（群 %s）判定为未通过（%s），剩余 %s 次机会。", user_id, group_id, source_label, plan.get("remaining"))
         elif action == "pass":
@@ -1083,25 +1115,34 @@ class TempReviewGroup(Star):
         user_id: str,
         entry: dict[str, Any],
         text: str,
-    ) -> tuple[bool, str]:
-        """返回（是否通过, 判定来源说明）。"""
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """返回（是否通过, 判定来源说明, 附带信息）。"""
         question = str(entry.get("question") or "")
         answers = [str(item) for item in (entry.get("answers") or [])]
+
+        if self._bili_enabled():
+            # 开了 B站 UID 审核就以它为准：判定是确定性的，不再走答案库与大模型
+            passed, reason, info = await self._bili_verify(text, user_id)
+            extra: dict[str, Any] = {}
+            if info:
+                extra["bili"] = info
+            return passed, f"B站 UID 审核·{reason}", extra
+
         mode = self._resolve_match_mode(entry.get("match_mode") or "inherit")
         rule_pass, detail = self._evaluate_rules(text, answers, mode, self._common_answers())
 
         review_mode = self._review_mode()
         if review_mode == "rule":
-            return rule_pass, f"规则·{detail}"
+            return rule_pass, f"规则·{detail}", {}
         if review_mode == "hybrid" and rule_pass:
-            return True, f"规则·{detail}"  # 规则先命中，省一次模型调用
+            return True, f"规则·{detail}", {}  # 规则先命中，省一次模型调用
 
         verdict = await self._llm_judge(event, group_id, user_id, question, answers, text)
         if verdict is None:
             # 模型不可用/超时/答复无法解析：回退规则判定，绝不让成员卡在流程里
             logger.warning("[审核群] LLM 审核未得出结论，已回退规则判定（群 %s 用户 %s）。", group_id, user_id)
-            return rule_pass, f"规则回退·{detail}"
-        return verdict, "大模型判定"
+            return rule_pass, f"规则回退·{detail}", {}
+        return verdict, "大模型判定", {}
 
     async def _llm_judge(
         self,
@@ -1265,6 +1306,10 @@ class TempReviewGroup(Star):
         if hint and hint not in question_text:
             # 该题配了提示但文案里没写 {hint}：直接附一行，避免"配了不生效"
             question_text = f"{question_text}\n提示：{hint}"
+        if self._bili_enabled():
+            uid_prompt = self._template("bili_uid_prompt").strip()
+            if uid_prompt and "UID" not in question_text.upper():
+                question_text = f"{question_text}\n{uid_prompt}"
 
         welcome_template = self._template("welcome_message").strip()
         welcome_text = ""
@@ -1456,7 +1501,12 @@ class TempReviewGroup(Star):
             lines.append(f"✅ 已通过（共 {len(approved)} 人，最多显示 20 条）：")
             for key, record in approved[:20]:
                 group_id, _, user_id = str(key).partition(":")
-                lines.append(f"· 群 {group_id} ｜ QQ {user_id} ｜ 通过于 {self._fmt_ts(record.get('at'))}")
+                bili = ""
+                if record.get("bili_uid"):
+                    bili = f" ｜ B站 {record.get('bili_name') or '（未取到昵称）'} UID {record.get('bili_uid')}"
+                lines.append(
+                    f"· 群 {group_id} ｜ QQ {user_id} ｜ 通过于 {self._fmt_ts(record.get('at'))}{bili}"
+                )
         yield event.plain_result("\n".join(lines))
 
     @review_cmd.command("诊断")
@@ -1496,6 +1546,19 @@ class TempReviewGroup(Star):
         reason = str(self._diag.get("last_reason") or "")
         if reason:
             lines.append(f"· 最近一次跳过原因：{reason}")
+        lines.append("")
+        if self._bili_enabled():
+            lines.append(
+                f"B站 UID 审核：✅ 已启用 ｜ 最低等级 {self._bili_min_level()} ｜ "
+                f"最低粉丝 {self._bili_min_fans()} ｜ 昵称关键词 {self._bili_name_keywords() or '无'} ｜ "
+                f"一 UID 一 QQ {'是' if self._bool('bili_uid_unique', True) else '否'} ｜ "
+                f"查不到时 {self._bili_on_error()}"
+            )
+            lines.append(
+                f"· 已绑定 UID {len(self._state.get('bili_uids') or {})} 个 ｜ 本次启动缓存 {len(self._bili_cache)} 条"
+            )
+        else:
+            lines.append("B站 UID 审核：未启用（bili_uid_enabled=false）")
         lines.append("")
         lines.append("结论：" + self._diag_verdict(counters))
 
@@ -1774,6 +1837,55 @@ class TempReviewGroup(Star):
         await self._forget_pending(group_id, user_id)
         yield event.plain_result(
             f"{'✅ 已移出' if ok else '❌ 移出失败（机器人可能不是群管理员）'} QQ {user_id}（群 {group_id}）"
+        )
+
+    @review_cmd.command("查UID")
+    async def review_bili_lookup(self, event: AstrMessageEvent, uid: str = ""):
+        """查询某个 B站 UID：/审核 查UID <UID>"""
+        if not await self._check_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以查询 UID。")
+            return
+        uid_text = self._extract_bili_uid(uid or event.message_str)
+        if not uid_text:
+            yield event.plain_result("用法：/审核 查UID <B站UID>（纯数字，也可以直接发主页链接）")
+            return
+        info, error = await self._bili_lookup_for_admin(uid_text)
+        lines = [f"🔎 B站 UID {uid_text}"]
+        if info is None:
+            lines.append(f"查询结果：❌ {error}")
+        else:
+            lines.append(f"昵称：{info.get('name') or '（空）'}")
+            lines.append(f"等级：{info.get('level')} ｜ 粉丝：{info.get('fans')}")
+            if info.get("sign"):
+                lines.append(f"签名：{str(info['sign'])[:60]}")
+            passed, reason = self._bili_rule_check(uid_text, "", info)
+            lines.append(f"按当前规则：{'✅ 通过' if passed else '❌ 不通过'}" + (f"（{reason}）" if reason else ""))
+        bound = self._bili_bound_qq(uid_text)
+        lines.append(f"绑定情况：{'QQ ' + bound if bound else '尚未被任何 QQ 绑定'}")
+        if not self._bili_enabled():
+            lines.append("提示：B站 UID 审核当前未启用（bili_uid_enabled=false）。")
+        yield event.plain_result("\n".join(lines))
+
+    @review_cmd.command("解绑")
+    async def review_bili_unbind(self, event: AstrMessageEvent, uid: str = ""):
+        """清除 UID↔QQ 绑定：/审核 解绑 <UID>"""
+        if not await self._check_admin(event):
+            yield event.plain_result("⛔ 只有管理员可以解绑 UID。")
+            return
+        uid_text = self._extract_bili_uid(uid or event.message_str)
+        if not uid_text:
+            yield event.plain_result("用法：/审核 解绑 <B站UID>")
+            return
+        async with self._lock:
+            record = (self._state.get("bili_uids") or {}).pop(uid_text, None)
+            if record is not None:
+                self._save_state()
+        if record is None:
+            yield event.plain_result(f"ℹ️ UID {uid_text} 本来就没有绑定记录。")
+            return
+        yield event.plain_result(
+            f"✅ 已解绑 UID {uid_text}（原绑定：QQ {record.get('qq')}"
+            f"{'，昵称 ' + str(record.get('name')) if record.get('name') else ''}）"
         )
 
     @review_cmd.command("清理")
@@ -2549,6 +2661,183 @@ class TempReviewGroup(Star):
                 },
             },
         )
+
+    # ------------------------------------------------------------------ B站 UID 审核
+
+    def _bili_enabled(self) -> bool:
+        return self._bool("bili_uid_enabled", False)
+
+    def _bili_on_error(self) -> str:
+        mode = str(self._get("bili_uid_on_error", "reject") or "reject").strip().lower()
+        return mode if mode in BILI_ON_ERROR_CHOICES else "reject"
+
+    def _bili_min_level(self) -> int:
+        return self._int("bili_uid_min_level", 0, minimum=0)
+
+    def _bili_min_fans(self) -> int:
+        return self._int("bili_uid_min_fans", 0, minimum=0)
+
+    def _bili_name_keywords(self) -> list[str]:
+        return self._id_list("bili_uid_name_keywords")
+
+    @staticmethod
+    def _extract_bili_uid(text: str) -> str | None:
+        """从回答里抠出 B站 UID：优先主页链接，其次 UID:123 这种写法，最后裸数字。"""
+        raw = str(text or "")
+        for pattern in (_BILI_UID_IN_URL_RE, _BILI_UID_LABELED_RE, _BILI_UID_BARE_RE):
+            match = pattern.search(raw)
+            if match:
+                uid = match.group(1).lstrip("0")
+                if uid.isdigit() and 1 <= len(uid) <= 10:
+                    return uid
+        return None
+
+    async def _bili_http_json(self, url: str, timeout: float, referer: str = "") -> dict[str, Any]:
+        """取 JSON。优先 aiohttp/httpx，都没有时退回线程里的 urllib（都不阻塞事件循环）。"""
+        headers = {
+            "User-Agent": BILI_USER_AGENT,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": referer or "https://www.bilibili.com/",
+        }
+        try:
+            import aiohttp  # type: ignore
+
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                    return json.loads(await resp.text())
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[审核群] aiohttp 请求失败，改用 httpx/urllib 重试", exc_info=True)
+        try:
+            import httpx  # type: ignore
+
+            async with httpx.AsyncClient(headers=headers, timeout=timeout) as client:
+                resp = await client.get(url)
+                return json.loads(resp.text)
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[审核群] httpx 请求失败，改用 urllib 重试", exc_info=True)
+
+        def _blocking() -> dict[str, Any]:
+            request = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return json.loads(response.read().decode("utf-8", "replace"))
+
+        return await asyncio.to_thread(_blocking)
+
+    async def _bili_lookup(self, uid: str) -> tuple[dict[str, Any] | None, str, str]:
+        """查询 B站账号，返回（信息, 原因, 类型）。类型为 not_found / error / ""。
+
+        「账号确实不存在」与「接口被风控/网络失败」必须分开：前者无论
+        bili_uid_on_error 怎么配都不该放行。
+        """
+        cached = self._bili_cache.get(uid)
+        now = time.time()
+        if cached and now - cached[0] < BILI_CACHE_TTL:
+            return dict(cached[1]), "", ""
+
+        url = f"{BILI_CARD_API}?mid={uid}&photo=false&jsonp=jsonp"
+        timeout = self._float("bili_uid_timeout_seconds", 10.0, minimum=1.0)
+        payload: dict[str, Any] | None = None
+        last_error = "查询失败"
+        for attempt in range(2):  # 风控(-799/-352/412)时短暂等待再试一次
+            try:
+                payload = await self._bili_http_json(url, timeout, referer=f"https://space.bilibili.com/{uid}")
+            except Exception as exc:
+                last_error = f"请求失败：{exc}"
+                logger.debug("[审核群] 查询 B站 UID %s 失败（第 %s 次）：%s", uid, attempt + 1, exc)
+                payload = None
+            if isinstance(payload, dict) and payload.get("code") == 0:
+                break
+            if isinstance(payload, dict) and payload.get("code") in BILI_NOT_FOUND_CODES:
+                break  # 账号确实不存在，不用重试
+            if attempt == 0:
+                await asyncio.sleep(BILI_RETRY_DELAY)
+
+        if not isinstance(payload, dict):
+            return None, last_error, "error"
+        code = payload.get("code")
+        if code in BILI_NOT_FOUND_CODES:
+            return None, "该 UID 在 B站不存在", "not_found"
+        if code != 0:
+            message = str(payload.get("message") or payload.get("msg") or code)
+            return None, f"B站接口未返回数据（{message}）", "error"
+
+        data = payload.get("data") or {}
+        card = data.get("card") if isinstance(data.get("card"), dict) else {}
+        level_info = card.get("level_info") if isinstance(card.get("level_info"), dict) else {}
+        try:
+            fans = int(card.get("fans") or data.get("follower") or 0)
+        except (TypeError, ValueError):
+            fans = 0
+        try:
+            level = int(level_info.get("current_level") or 0)
+        except (TypeError, ValueError):
+            level = 0
+        info = {
+            "uid": str(uid),
+            "name": str(card.get("name") or ""),
+            "level": level,
+            "fans": fans,
+            "sign": str(card.get("sign") or ""),
+            "at": now,
+        }
+        self._bili_cache[uid] = (now, dict(info))
+        return info, "", ""
+
+    def _bili_bound_qq(self, uid: str) -> str:
+        record = (self._state.get("bili_uids") or {}).get(str(uid))
+        return str(record.get("qq") or "") if isinstance(record, dict) else ""
+
+    def _bili_bind(self, uid: str, user_id: str, name: str, group_id: str) -> None:
+        """记录 UID 与 QQ 的绑定（审计 + 去重）。调用方需持锁或保证串行。"""
+        self._state.setdefault("bili_uids", {})[str(uid)] = {
+            "qq": str(user_id),
+            "name": str(name),
+            "group_id": str(group_id),
+            "at": time.time(),
+        }
+
+    def _bili_rule_check(self, uid: str, user_id: str, info: dict[str, Any]) -> tuple[bool, str]:
+        """按配置校验账号信息，返回（是否通过, 原因）。"""
+        min_level = self._bili_min_level()
+        if min_level and int(info.get("level") or 0) < min_level:
+            return False, f"B站等级 {info.get('level')} < 要求的 {min_level}"
+        min_fans = self._bili_min_fans()
+        if min_fans and int(info.get("fans") or 0) < min_fans:
+            return False, f"B站粉丝数 {info.get('fans')} < 要求的 {min_fans}"
+        keywords = self._bili_name_keywords()
+        if keywords:
+            name = str(info.get("name") or "")
+            if not any(keyword in name for keyword in keywords):
+                return False, f"B站昵称「{name}」不含指定关键词（{'、'.join(keywords)}）"
+        if self._bool("bili_uid_unique", True):
+            bound = self._bili_bound_qq(uid)
+            if bound and bound != str(user_id):
+                return False, f"该 UID 已被 QQ {bound} 使用过"
+        return True, ""
+
+    async def _bili_verify(self, text: str, user_id: str) -> tuple[bool, str, dict[str, Any] | None]:
+        """B站 UID 审核主流程：抽取 UID → 查询 → 规则校验。返回（是否通过, 原因, 账号信息）。"""
+        uid = self._extract_bili_uid(text)
+        if not uid:
+            return False, "没有识别到 B站 UID（请发送纯数字 UID 或主页链接）", None
+        info, error, kind = await self._bili_lookup(uid)
+        if info is None:
+            if kind != "not_found" and self._bili_on_error() == "pass":
+                logger.warning("[审核群] B站 UID %s 查询失败（%s），按 bili_uid_on_error=pass 放行。", uid, error)
+                return True, f"B站查询失败但按配置放行（{error}）", {"uid": uid, "name": "", "level": 0, "fans": 0, "unverified": True}
+            return False, error, None
+        passed, reason = self._bili_rule_check(uid, user_id, info)
+        if not passed:
+            return False, reason, info
+        return True, f"B站账号「{info.get('name')}」(UID {uid}，等级 {info.get('level')}，粉丝 {info.get('fans')}) 校验通过", info
+
+    async def _bili_lookup_for_admin(self, uid: str) -> tuple[dict[str, Any] | None, str]:
+        info, error, _kind = await self._bili_lookup(uid)
+        return info, error
 
     # ------------------------------------------------------------------ 平台调用辅助
 

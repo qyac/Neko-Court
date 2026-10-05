@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.3",
+            version="v1.1.4",
             desc="自检用元数据",
         )
 
@@ -498,6 +498,27 @@ def mentions_of(bucket):
             if type(component).__name__ == "At":
                 targets.append(str(getattr(component, "qq", "")))
     return targets
+
+
+def bili_card(name="测试UP", level=3, fans=100, sign="", uid="12345678", code=0, message="OK"):
+    """构造 B站 card 接口的返回（形状取自真实响应）。"""
+    if code != 0:
+        return {"code": code, "message": message}
+    return {
+        "code": 0,
+        "message": "OK",
+        "data": {
+            "card": {
+                "mid": str(uid),
+                "name": name,
+                "fans": fans,
+                "sign": sign,
+                "level_info": {"current_level": level},
+            },
+            "follower": fans,
+            "following": 10,
+        },
+    }
 
 
 # --------------------------------------------------------------------------- 用例
@@ -1647,7 +1668,256 @@ async def main():
         check("欢迎加入本群" not in renew_text, "/审核 重审 不重复发欢迎语（只补问题）")
         check("已重置" in chain_text(renew_replies[0]), "/审核 重审 仍有回执")
 
-        print("\n[21] Pages 资源结构")
+        print("\n[21] B站 UID 审核")
+        reset_review(review_mode="rule", code_send_mode="private", private_send_channel="auto")
+        module.BILI_RETRY_DELAY = 0  # 重试等待在自检里不需要真等
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "请证明你是真人：", "hint": "", "answers": ["abc"], "match_mode": "inherit"}
+        ]
+        plugin.config["bili_uid_enabled"] = True
+        plugin.config["bili_uid_min_level"] = 0
+        plugin.config["bili_uid_min_fans"] = 0
+        plugin.config["bili_uid_name_keywords"] = []
+        plugin.config["bili_uid_unique"] = True
+        plugin.config["bili_uid_on_error"] = "reject"
+        plugin.config["bili_uid_timeout_seconds"] = 10.0
+        plugin.config["bili_uid_prompt"] = "请把你的 B站 UID 发给我（纯数字，例如 12345678；也可以直接发你的 B站主页链接）"
+        plugin.config["retry_message"] = "回答不正确，你还有 {remaining} 次机会。"
+
+        # 1) UID 抽取
+        extract = module.TempReviewGroup._extract_bili_uid
+        check(extract("12345678") == "12345678", "抽取纯数字 UID")
+        check(extract("我的UID：12345678") == "12345678", "抽取 UID:xxx 写法")
+        check(extract("https://space.bilibili.com/12345678") == "12345678", "抽取主页链接里的 UID")
+        check(extract("UID = 998877") == "998877", "抽取等号写法")
+        check(extract("我不知道") is None, "没有数字时返回 None")
+        check(extract("我有 3 个号") is None, "1 位数字不算 UID（避免误判）")
+
+        # 2) 假 HTTP：按 UID 配响应（列表=按顺序消费，最后一条可重复用）
+        http_calls = []
+        http_urls = []
+        responses = {}
+
+        async def fake_http(url, timeout, referer=""):
+            mid = url.split("mid=")[1].split("&")[0]
+            http_calls.append(mid)
+            http_urls.append(url)
+            if mid not in responses:
+                raise AssertionError(f"自检没有为 UID {mid} 配置响应")
+            item = responses[mid]
+            if isinstance(item, list):
+                item = item.pop(0) if len(item) > 1 else item[0]
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        def reset_http():
+            http_calls.clear()
+            http_urls.clear()
+            responses.clear()
+            plugin._bili_cache.clear()
+            plugin._state["bili_uids"] = {}
+
+        plugin._bili_http_json = fake_http
+
+        # 3) 查询成功 + 缓存
+        reset_http()
+        responses["12345678"] = bili_card(name="小明", level=4, fans=520, sign="签名")
+        info, error, kind = await plugin._bili_lookup("12345678")
+        check(info is not None and error == "" and kind == "", "查询成功返回账号信息")
+        check(info["name"] == "小明" and info["level"] == 4 and info["fans"] == 520, "解析昵称/等级/粉丝")
+        check(http_calls == ["12345678"] and "photo=false" in http_urls[0], "请求带 mid 与 photo=false")
+        await plugin._bili_lookup("12345678")
+        check(http_calls == ["12345678"], "命中缓存不重复请求 B站")
+
+        # 4) 账号不存在：即使 on_error=pass 也必须拒绝，且不重试
+        reset_http()
+        plugin.config["bili_uid_on_error"] = "pass"
+        responses["9999999999"] = bili_card(code=-404, message="啥都木有")
+        passed, reason, _info = await plugin._bili_verify("9999999999", "80001")
+        check(not passed and "不存在" in reason, f"账号不存在时一定不通过（{reason}）")
+        check(http_calls == ["9999999999"], "账号不存在不重试")
+
+        # 5) 风控：reject 拒绝（重试一次后放弃）
+        reset_http()
+        plugin.config["bili_uid_on_error"] = "reject"
+        responses["12345678"] = [
+            bili_card(code=-799, message="请求过于频繁"),
+            bili_card(code=-799, message="请求过于频繁"),
+        ]
+        passed, reason, _info = await plugin._bili_verify("12345678", "80001")
+        check(not passed and "频繁" in reason, f"风控时按 reject 拒绝（{reason}）")
+        check(http_calls == ["12345678", "12345678"], "风控会重试一次再放弃")
+
+        # 6) 风控：pass 放行并标记未核验
+        reset_http()
+        plugin.config["bili_uid_on_error"] = "pass"
+        responses["12345678"] = bili_card(code=-799, message="请求过于频繁")
+        passed, reason, info = await plugin._bili_verify("12345678", "80001")
+        check(passed and "放行" in reason and info.get("unverified") is True, "风控时按 pass 放行并标记未核验")
+
+        # 7) 先风控后成功
+        reset_http()
+        plugin.config["bili_uid_on_error"] = "reject"
+        responses["23456789"] = [
+            bili_card(code=-799, message="请求过于频繁"),
+            bili_card(name="重试成功", level=2, fans=1),
+        ]
+        passed, _reason, info = await plugin._bili_verify("23456789", "80002")
+        check(passed and info["name"] == "重试成功", "风控后重试成功即通过")
+
+        # 8) 网络异常
+        reset_http()
+        responses["34567890"] = RuntimeError("连接超时")
+        passed, reason, _info = await plugin._bili_verify("34567890", "80003")
+        check(not passed and "请求失败" in reason, f"网络异常按 reject 判不通过（{reason}）")
+
+        # 9) 规则：等级 / 粉丝 / 昵称关键词
+        reset_http()
+        plugin.config["bili_uid_min_level"] = 3
+        responses["45678901"] = bili_card(name="低等级", level=1, fans=999)
+        passed, reason, _info = await plugin._bili_verify("45678901", "80004")
+        check(not passed and "等级" in reason, f"等级不足被拒（{reason}）")
+        plugin.config["bili_uid_min_level"] = 0
+
+        reset_http()
+        plugin.config["bili_uid_min_fans"] = 100
+        responses["56789012"] = bili_card(name="没粉丝", level=6, fans=9)
+        passed, reason, _info = await plugin._bili_verify("56789012", "80005")
+        check(not passed and "粉丝" in reason, f"粉丝不足被拒（{reason}）")
+        plugin.config["bili_uid_min_fans"] = 0
+
+        reset_http()
+        plugin.config["bili_uid_name_keywords"] = ["猫", "neko"]
+        responses["67890123"] = bili_card(name="狗子", level=6, fans=100)
+        passed, reason, _info = await plugin._bili_verify("67890123", "80006")
+        check(not passed and "昵称" in reason, f"昵称不含关键词被拒（{reason}）")
+        responses["67890124"] = bili_card(name="neko猫猫", level=6, fans=100)
+        passed, _reason, _info = await plugin._bili_verify("67890124", "80006")
+        check(passed, "昵称含关键词则通过")
+        plugin.config["bili_uid_name_keywords"] = []
+
+        # 10) 一 UID 一 QQ
+        reset_http()
+        plugin._bili_bind("78901234", "80007", "占位", "123456")
+        responses["78901234"] = bili_card(name="复用者", level=6, fans=100, uid="78901234")
+        passed, reason, _info = await plugin._bili_verify("78901234", "80008")
+        check(not passed and "已被 QQ 80007" in reason, f"同一 UID 被别的 QQ 复用会被拒（{reason}）")
+        passed, _reason, _info = await plugin._bili_verify("78901234", "80007")
+        check(passed, "同一个 QQ 再用自己的 UID 仍然通过")
+        check(plugin._state["bili_uids"]["78901234"]["qq"] == "80007", "绑定记录里保存了 QQ")
+
+        # 11) 提问时自动附上索取 UID 的提示（问题文案里没提 UID）
+        reset_http()
+        ask = FakeEvent(post_type="notice", notice_type="group_increase", user_id="80010")
+        await plugin.on_group_notice(ask)
+        question_text = chain_text(ask.sent[0])
+        check("B站 UID" in question_text and "请证明你是真人" in question_text, "提问会附上索取 UID 的提示")
+        check(question_text.count("UID") == 1, "提示只出现一次")
+
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "你的 UID 是多少？", "hint": "", "answers": ["abc"], "match_mode": "inherit"}
+        ]
+        ask_dup = FakeEvent(post_type="notice", notice_type="group_increase", user_id="80012")
+        await plugin.on_group_notice(ask_dup)
+        check("发给我" not in chain_text(ask_dup.sent[0]), "问题里已经提到 UID 时不重复追加提示")
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "请证明你是真人：", "hint": "", "answers": ["abc"], "match_mode": "inherit"}
+        ]
+
+        # 12) 端到端：UID 正确即通过并发码，大模型完全不参与
+        reset_review(review_mode="llm", code_send_mode="private", private_send_channel="auto")
+        plugin.config["bili_uid_enabled"] = True
+        plugin.config["bili_uid_unique"] = True
+        plugin._state["pending"] = {}
+        plugin._state["approved"] = {}
+        reset_http()
+        llm_provider = FakeProvider(reply="PASS")
+        context.providers = [llm_provider]
+        context.using_provider = llm_provider
+        context.sent.clear()
+        await plugin.on_group_notice(FakeEvent(post_type="notice", notice_type="group_increase", user_id="80020"))
+        responses["88880000"] = bili_card(name="申请人", level=5, fans=66, uid="88880000")
+        ok_event = FakeEvent(user_id="80020", text="我的UID是 88880000")
+        await plugin.on_group_message(ok_event)
+        approved = plugin._state["approved"].get("123456:80020") or {}
+        check(approved.get("bili_uid") == "88880000", f"通过后记录 B站 UID（{approved.get('bili_uid')}）")
+        check(approved.get("bili_name") == "申请人", f"通过后记录 B站昵称（{approved.get('bili_name')}）")
+        check(plugin._bili_bound_qq("88880000") == "80020", "UID 与 QQ 的绑定已写入状态")
+        check(llm_provider.calls == [], "开了 UID 审核时不会调用大模型（判定是确定性的）")
+        temp_sent = client.temp_sessions
+        current_code = plugin._state["code"]
+        check(
+            temp_sent
+            and str(temp_sent[-1].get("user_id")) == "80020"
+            and current_code in str(temp_sent[-1].get("message") or ""),
+            f"通过后照常下发验证码（群临时会话 {len(temp_sent)} 条）",
+        )
+        check("123456:80020" not in plugin._state["pending"], "通过后清理待审核记录")
+
+        # 13) UID 不存在 → 按答错处理；没有 UID → 明确原因
+        await plugin.on_group_notice(FakeEvent(post_type="notice", notice_type="group_increase", user_id="80021"))
+        responses["11112222"] = bili_card(code=-404, message="啥都木有")
+        wrong_event = FakeEvent(user_id="80021", text="我的UID是 11112222")
+        await plugin.on_group_message(wrong_event)
+        wrong_text = chain_text(wrong_event.sent[0])
+        check("不正确" in wrong_text and "2 次机会" in wrong_text, "UID 不存在时按答错处理并提示剩余次数")
+        check("不存在" in wrong_text and "原因：" in wrong_text, f"答错提示里说明了原因（{wrong_text.splitlines()[-1][:40]}）")
+        check("123456:80021" in plugin._state["pending"], "答错后仍在待审核队列")
+        no_uid_event = FakeEvent(user_id="80021", text="我不想说")
+        await plugin.on_group_message(no_uid_event)
+        check("没有识别到" in chain_text(no_uid_event.sent[0]), "回答里没有 UID 时给出明确原因")
+
+        # 14) 管理指令
+        reset_http()
+        responses["99990000"] = bili_card(name="被查的人", level=6, fans=1234, uid="99990000")
+        plugin._bili_bind("99990000", "80030", "被查的人", "123456")
+        lookup_reply = chain_text([r async for r in plugin.review_bili_lookup(admin_event, "99990000")][0])
+        check("被查的人" in lookup_reply and "等级：6" in lookup_reply, "查UID 显示昵称与等级")
+        check("按当前规则" in lookup_reply and "绑定情况" in lookup_reply, "查UID 显示规则判定与绑定情况")
+        check("QQ 80030" in lookup_reply, "查UID 显示占用该 UID 的 QQ")
+        check(
+            "只有管理员" in chain_text([r async for r in plugin.review_bili_lookup(FakeEvent(user_id="10001"), "1")][0]),
+            "查UID 有权限校验",
+        )
+
+        plugin._bili_bind("88880000", "80020", "申请人", "123456")
+        unbind_reply = chain_text([r async for r in plugin.review_bili_unbind(admin_event, "88880000")][0])
+        check("已解绑" in unbind_reply, "解绑指令生效")
+        check(plugin._bili_bound_qq("88880000") == "", "解绑后绑定记录被清除")
+        check(
+            "本来就没有绑定" in chain_text([r async for r in plugin.review_bili_unbind(admin_event, "88880000")][0]),
+            "重复解绑给出提示",
+        )
+
+        # 15) 诊断 / 状态 / 配置校验
+        diag_text = chain_text([r async for r in plugin.review_diagnose(admin_event)][0])
+        check("B站 UID 审核" in diag_text and "已启用" in diag_text, "诊断报告包含 B站 UID 审核状态")
+        check("已绑定 UID" in diag_text, "诊断报告显示绑定数量")
+        status_text = chain_text([r async for r in plugin.review_status(admin_event)][0])
+        check("已通过" in status_text, "状态报告仍正常输出")
+
+        FAKE_REQUEST.payload = {"values": {"bili_uid_on_error": "maybe"}}
+        resp = await plugin.api_save_settings()
+        check(
+            resp["status_code"] == 400 and "bili_uid_on_error" in resp["payload"]["message"],
+            "非法的 bili_uid_on_error 被拒绝",
+        )
+        FAKE_REQUEST.payload = {"values": {"bili_uid_min_level": 9}}
+        resp = await plugin.api_save_settings()
+        check(resp["status_code"] == 400, "越界的 bili_uid_min_level 被拒绝")
+
+        # 收尾：恢复真实实现
+        plugin.__dict__.pop("_bili_http_json", None)
+        plugin.config["bili_uid_enabled"] = False
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "1+1=?", "hint": "", "answers": ["2"], "match_mode": "inherit"}
+        ]
+        context.providers = []
+        context.using_provider = None
+        reset_review(review_mode="rule")
+
+        print("\n[22] Pages 资源结构")
         pages = {
             "settings": ("index.html", "app.js", "settings.js", "style.css"),
             "questions": ("index.html", "app.js", "bank.js", "style.css"),
