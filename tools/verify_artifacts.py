@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import hashlib
 import subprocess
 import sys
@@ -112,8 +113,17 @@ def check_zip(zip_path: Path, problems: list[str]) -> int:
         return len(install)
 
 
+def _version_key(path: Path) -> tuple:
+    """按版本号数字排序，避免 v1.1.10 被当成比 v1.1.9 旧（纯字符串排序会踩这个坑）。"""
+    match = re.search(r"-v(\d+(?:\.\d+)*)\.zip$", path.name)
+    if not match:
+        return ((), path.name)
+    numbers = tuple(int(part) for part in match.group(1).split("."))
+    return (numbers, path.name)
+
+
 def newest(pattern: str) -> Path | None:
-    candidates = sorted(DIST.glob(pattern))
+    candidates = sorted(DIST.glob(pattern), key=_version_key)
     return candidates[-1] if candidates else None
 
 

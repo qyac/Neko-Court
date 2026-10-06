@@ -60,7 +60,7 @@ except Exception:  # pragma: no cover - 兼容没有 astrbot.api.web 的版本
 PLUGIN_NAME = "astrbot_plugin_temp_review_group"
 # 下面两项与 metadata.yaml 保持一致，仅在读不到插件元数据时作为兜底展示
 PLUGIN_DISPLAY_NAME = "临时审核群管理"
-PLUGIN_VERSION = "v1.1.9"
+PLUGIN_VERSION = "v1.2.0"
 STATE_FILE = "state.json"
 SCHEMA_FILE = "_conf_schema.json"
 WEB_API_PREFIX = f"/{PLUGIN_NAME}"
@@ -1126,6 +1126,14 @@ class TempReviewGroup(Star):
             return True
         return self._bool("web_review_enabled", False) and bool(self._web_review_url()) and bool(self._web_review_token())
 
+    def _question_mode(self) -> str:
+        """题目来源：plugin（默认，以插件题库为准）或 site（以网站题库为准，反向同步回插件）。"""
+        mode = str(self._get("web_question_mode", "plugin") or "plugin").strip().lower()
+        return mode if mode in ("plugin", "site") else "plugin"
+
+    def _web_review_push_code(self) -> bool:
+        return self._bool("web_review_push_code", True)
+
     def _web_review_poll_seconds(self) -> int:
         return self._int("web_review_poll_seconds", 30, minimum=5)
 
@@ -1223,6 +1231,8 @@ class TempReviewGroup(Star):
             "common_answers": self._common_answers(),
             "match_mode": self._match_mode(),
             "fuzzy_threshold": self._fuzzy_threshold(),
+            "question_mode": self._question_mode(),
+            "push_code": self._web_review_push_code(),
             "stats": {"pending": len(self._state.get("pending") or {}), "approved": len(self._state.get("approved") or {})},
             "pulled": int(stats.get("pulled") or 0),
         }
@@ -1269,6 +1279,7 @@ class TempReviewGroup(Star):
         code = str(self._state.get("code") or "")
         acked: list[int] = []
         accepted = 0
+        newly_approved: list[str] = []  # 锁外再发码：发消息是网络 I/O，不能占着状态锁
         async with self._lock:
             now = time.time()
             for item in items:
@@ -1295,6 +1306,7 @@ class TempReviewGroup(Star):
                 if uid:
                     self._bili_bind(uid, user_id, name, groups[0] if groups else "")
                 accepted += 1
+                newly_approved.append(user_id)
                 if str(app_id).isdigit():
                     acked.append(int(app_id))
             record = self._state.setdefault("web_review", {})
@@ -1315,17 +1327,117 @@ class TempReviewGroup(Star):
             # 没 ack 成功不要紧：下一轮会重复拉到，写入是幂等的
             return accepted, f"已接收 {accepted} 条，但 ack 失败（下轮会重试）：{exc}"
         logger.info("[审核群] 已接收 %s 条网页审核通过记录（同步到 %s 个群）。", accepted, len(groups))
-        return accepted, f"已接收 {accepted} 条网页通过记录并 ack"
+        push_note = ""
+        if newly_approved and self._web_review_push_code():
+            sent = 0
+            for user_id in dict.fromkeys(newly_approved):
+                if await self._push_code_to(user_id, groups[0] if groups else ""):
+                    sent += 1
+            push_note = f"，已立即私发验证码 {sent}/{len(set(newly_approved))} 人"
+        return accepted, f"已接收 {accepted} 条网页通过记录并 ack{push_note}"
+
+    async def _web_review_pull_questions(self) -> tuple[int, str]:
+        """反向同步：网站后台维护的题库拉回来写进插件配置（仅 web_question_mode=site 时）。"""
+        if self._question_mode() != "site":
+            return 0, "题目来源是插件题库，无需反向同步"
+        if not self._web_review_enabled():
+            return 0, "未启用"
+        base, target_token = self._web_review_target()
+        try:
+            data = await self._http_json(
+                "GET",
+                f"{base}/api/plugin/questions",
+                headers={"X-Review-Token": target_token},
+            )
+        except Exception as exc:
+            return 0, f"拉取题库失败：{exc}"
+        if not isinstance(data, dict) or not data.get("ok"):
+            return 0, f"拉取题库被拒绝：{str(data)[:120]}"
+        items = [
+            {
+                "__template_key": QUESTION_BANK_TEMPLATE_KEY,
+                "enabled": bool(item.get("enabled", True)),
+                "question": str(item.get("question") or "")[:300],
+                "hint": str(item.get("hint") or "")[:200],
+                "answers": [str(answer)[:120] for answer in (item.get("answers") or [])][:30],
+                "match_mode": (
+                    str(item.get("match_mode") or "inherit")
+                    if str(item.get("match_mode") or "inherit") in MATCH_MODE_CHOICES
+                    else "inherit"
+                ),
+            }
+            for item in (data.get("questions") or [])
+            if isinstance(item, dict) and str(item.get("question") or "").strip()
+        ]
+        if not items:
+            return 0, "网站题库里还没有启用的题目"
+        common = [str(item)[:120] for item in (data.get("common_answers") or [])][:50]
+        # 只在内容真的变了才写配置，避免每轮都改配置文件
+        signature = json.dumps({"questions": items, "common": common}, ensure_ascii=False, sort_keys=True)
+        state = self._state.setdefault("web_review", {})
+        if state.get("questions_signature") == signature:
+            return 0, "网站题库没有变化"
+        try:
+            await self._persist_config({"questions": items, "common_answers": common})
+        except Exception as exc:
+            logger.exception("[审核群] 把网站题库写回插件配置失败")
+            return 0, f"写回插件配置失败：{exc}"
+        async with self._lock:
+            record = self._state.setdefault("web_review", {})
+            record["questions_signature"] = signature
+            record["questions_pulled_at"] = time.time()
+            record["questions_pulled_count"] = len(items)
+            record["last_error"] = ""
+            self._save_state()
+        logger.info("[审核群] 已从网站后台同步题库：%s 条题目、%s 条通用答案。", len(items), len(common))
+        return len(items), f"已从网站同步 {len(items)} 条题目"
+
+    async def _push_code_to(self, user_id: str, group_id: str) -> bool:
+        """把当日验证码私发给某个成员（用于"网站后台一键通过后立即发码"）。"""
+        code = str(self._state.get("code") or "")
+        if not code:
+            return False
+        try:
+            result = await self._deliver_code(
+                group_id=str(group_id or ""),
+                user_id=str(user_id),
+                platform_id="",
+                code=code,
+                user_name=str(user_id),
+            )
+        except Exception:
+            logger.exception("[审核群] 给 %s 立即发码失败", user_id)
+            return False
+        ok = bool(result.get("private"))
+        if ok:
+            logger.info("[审核群] 已把验证码私发给网站后台通过的成员 %s。", user_id)
+        elif result.get("group_code"):
+            logger.warning(
+                "[审核群] 当前发码方式不是私聊，无法给 %s 立即私发验证码；他入群后会在群里看到验证码。",
+                user_id,
+            )
+        else:
+            logger.warning(
+                "[审核群] 给 %s 立即发码失败（临时会话与好友私聊都没成功）；他入群时还会再发一次。",
+                user_id,
+            )
+        return ok
 
     async def _web_review_once(self) -> tuple[bool, int, str]:
-        """跑一轮：先同步（把验证码/规则推上去），再拉取名单。"""
+        """跑一轮：先同步（把验证码/规则/题库推上去），再拉取名单，必要时反向拉题库。"""
         synced, sync_note = await self._web_review_sync()
-        pulled, pull_note = await self._web_review_pull()
-        if not synced:
+        pushed, push_note = (0, "未拉取")
+        if synced:
+            pushed, push_note = await self._web_review_pull()
+        else:
             async with self._lock:
                 self._web_review_set(last_error=sync_note, last_attempt_at=time.time())
                 self._save_state()
-        return synced, pulled, f"{sync_note}；{pull_note}"
+        question_note = ""
+        if synced and self._question_mode() == "site":
+            _count, question_note = await self._web_review_pull_questions()
+        note = f"{sync_note}；{push_note}" + (f"；{question_note}" if question_note else "")
+        return synced, pushed, note
 
     async def _web_review_loop(self) -> None:
         await asyncio.sleep(3.0)  # 等启动流程走完
@@ -2030,7 +2142,13 @@ class TempReviewGroup(Star):
                 f"轮询 {self._web_review_poll_seconds()} 秒 ｜ 累计接收 {int(status.get('pulled') or 0)} 条"
             )
             usable_questions = [item for item in self._questions() if self._question_usable(item)]
-            lines.append(f"· 已同步题库 {len(self._questions(include_disabled=True))} 条（可用 {len(usable_questions)} 条）给网站出题")
+            if self._question_mode() == "site":
+                lines.append("· 题目来源：网站题库（后台维护），插件每轮拉回来用")
+            else:
+                lines.append(
+                    f"· 题目来源：插件题库，已同步 {len(self._questions(include_disabled=True))} 条"
+                    f"（可用 {len(usable_questions)} 条）给网站出题"
+                )
             if not status.get("last_sync_at"):
                 lines.append("· 还没成功同步过：检查 web_review_url / web_review_token，或网络是否可达")
             elif status.get("last_error"):
@@ -2452,10 +2570,20 @@ class TempReviewGroup(Star):
         lines.append(f"网站端待投递：{int(status.get('pending_deliveries') or 0)} 条")
         all_questions = self._questions(include_disabled=True)
         usable = [item for item in self._questions() if self._question_usable(item)]
-        lines.append(
-            f"题库同步：{len(all_questions)} 条（可用 {len(usable)} 条 ｜ 通用答案 {len(self._common_answers())} 条）"
-            "→ 网站没有自己的题库时就用这套出题"
-        )
+        if self._question_mode() == "site":
+            pulled_at = float(query.get("questions_pulled_at") or 0)
+            pulled_count = int(query.get("questions_pulled_count") or 0)
+            when = time.strftime("%m-%d %H:%M", time.localtime(pulled_at)) if pulled_at else "还没拉过"
+            lines.append(
+                f"题目来源：网站题库（后台维护）｜ 已同步 {pulled_count} 条（{when}）"
+                f" ｜ 通用答案 {len(self._common_answers())} 条"
+            )
+        else:
+            lines.append(
+                f"题目来源：插件题库 ｜ 同步给网站 {len(all_questions)} 条（可用 {len(usable)} 条 ｜ "
+                f"通用答案 {len(self._common_answers())} 条）"
+            )
+        lines.append("发码：网站后台通过后" + ("立即私发验证码" if self._web_review_push_code() else "等他入群时再发"))
         if status.get("last_error"):
             lines.append(f"⚠️ 最近错误：{status['last_error']}")
         lines.append("其它用法：/审核 网站 同步 ｜ 地址 ｜ token ｜ 密码 <新密码>")

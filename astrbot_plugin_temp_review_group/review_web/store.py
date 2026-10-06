@@ -52,6 +52,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "plugin_fuzzy_threshold": 0.8,
     "plugin_questions_synced_at": 0,
     "web_ask_questions": True,       # 网页是否要求答题（没有可用题目时自动跳过）
+    "answer_max_attempts": 3,        # 同一 QQ 在窗口内最多答错几次（0 = 不限）
+    "answer_window_hours": 24,       # 答错次数的统计窗口（小时）
+    "plugin_question_mode": "plugin",# 题目来源：plugin=以插件题库为准；site=以网站题库为准
     "site_common_answers": [],       # 站点自己的通用答案库
     "site_match_mode": "contains",   # 站点题库的默认匹配方式（题目写 inherit 时用它）
     "site_fuzzy_threshold": 0.8,
@@ -470,6 +473,21 @@ class Store:
             cursor = conn.execute("DELETE FROM questions WHERE id=?", (int(question_id),))
             conn.commit()
             return cursor.rowcount > 0
+
+    def count_wrong_answers(self, qq: str, *, since: float = 0.0) -> int:
+        """统计某个 QQ 在窗口内答错的次数（用于限制反复试答案）。"""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM applications WHERE qq = ? AND answer_ok = 0 AND created_at >= ?",
+                (str(qq), float(since)),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def questions_updated_at(self) -> float:
+        """站点题库最近一次修改时间（反向同步时给插件判断新旧）。"""
+        with self._connect() as conn:
+            row = conn.execute("SELECT MAX(updated_at) AS t FROM questions").fetchone()
+        return float(row["t"] or 0) if row else 0.0
 
     def clear_questions(self) -> int:
         with self._connect() as conn:

@@ -169,16 +169,28 @@ class App:
     def plugin_token(self) -> str:
         return str(self.store.get_setting("plugin_token") or "")
 
+    def question_mode(self, settings: dict[str, Any] | None = None) -> str:
+        """题目来源模式：plugin = 以插件题库为准（默认）；site = 以网站题库为准。"""
+        data = settings or self.settings()
+        mode = str(data.get("plugin_question_mode") or "plugin").strip().lower()
+        return mode if mode in ("plugin", "site") else "plugin"
+
     def question_bank(self, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-        """网页出题用的题库：**站点自己的题库优先**，没配就用插件同步过来的。"""
+        """网页出题用的题库。
+
+        来源由插件同步过来的 `plugin_question_mode` 决定：
+        - `plugin`（默认）：用插件题库，**忽略站点题库**（避免两边不一致时"网页和 QQ 出的题不一样"）；
+        - `site`：只用站点题库（插件侧会反向拉取站点题库，让 QQ 也用这套题）。
+        """
         data = settings or self.settings()
         site_common = [str(item).strip() for item in (data.get("site_common_answers") or []) if str(item).strip()]
         plugin_common = [str(item).strip() for item in (data.get("plugin_common_answers") or []) if str(item).strip()]
         common = list(dict.fromkeys([*site_common, *plugin_common]))
-        site_items = self.store.list_questions(only_enabled=True)
-        if site_items:
+        if self.question_mode(data) == "site":
+            site_items = self.store.list_questions(only_enabled=True)
             return {
-                "source": "site",
+                "source": "site" if site_items else "none",
+                "mode": "site",
                 "items": site_items,
                 "common": common,
                 "match_mode": str(data.get("site_match_mode") or matching.DEFAULT_MATCH_MODE),
@@ -191,6 +203,7 @@ class App:
         ]
         return {
             "source": "plugin" if plugin_items else "none",
+            "mode": "plugin",
             "items": plugin_items,
             "common": common,
             "match_mode": str(data.get("plugin_match_mode") or matching.DEFAULT_MATCH_MODE),
@@ -449,6 +462,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._api_admin_export()
             if path == "/api/admin/logout":
                 return self._api_admin_logout()
+            if path == "/api/plugin/questions":
+                return self._api_plugin_questions()
             if path == "/api/plugin/applications":
                 return self._api_plugin_applications(query)
             if path == "/api/plugin/ping":
@@ -763,6 +778,16 @@ class Handler(BaseHTTPRequestHandler):
             return True, "题目已更新，请刷新页面重新作答", {}
         if not answer:
             return True, "请把审核问题的答案填上", {}
+        limit = self._safe_int(settings.get("answer_max_attempts"), 3)
+        if limit > 0:
+            window_hours = max(1, self._safe_int(settings.get("answer_window_hours"), 24))
+            since = time.time() - window_hours * 3600
+            wrong = self.store.count_wrong_answers(str(payload.get("qq") or "").strip(), since=since)
+            if wrong >= limit:
+                return True, (
+                    f"答题错误次数过多（{window_hours} 小时内已答错 {wrong} 次，上限 {limit} 次）。"
+                    "请联系管理员人工处理，或稍后再试。"
+                ), {}
         mode = matching.resolve_mode(entry.get("match_mode"), bank["match_mode"])
         passed, detail = matching.evaluate(answer, list(entry.get("answers") or []), mode, bank["common"], bank["threshold"])
         record = {
@@ -961,6 +986,16 @@ class Handler(BaseHTTPRequestHandler):
             self.store.set_setting("use_plugin_rules", bool(payload.get("use_plugin_rules")))
         if "web_ask_questions" in payload:
             self.store.set_setting("web_ask_questions", bool(payload.get("web_ask_questions")))
+        if "answer_max_attempts" in payload:
+            raw_limit = payload.get("answer_max_attempts")
+            if isinstance(raw_limit, (list, dict)):
+                return self._error(400, "答题次数上限必须是数字")
+            self.store.set_setting("answer_max_attempts", max(0, min(50, self._safe_int(raw_limit, 3))))
+        if "answer_window_hours" in payload:
+            raw_window = payload.get("answer_window_hours")
+            if isinstance(raw_window, (list, dict)):
+                return self._error(400, "统计窗口必须是数字")
+            self.store.set_setting("answer_window_hours", max(1, min(720, self._safe_int(raw_window, 24))))
         if "bili_on_error" in payload:
             value = str(payload.get("bili_on_error") or "manual").lower()
             self.store.set_setting("bili_on_error", value if value in ("reject", "manual", "pass") else "manual")
@@ -1041,6 +1076,10 @@ class Handler(BaseHTTPRequestHandler):
         return {
             "ok": True,
             "ask_questions": bool(settings.get("web_ask_questions", True)),
+            "question_mode": self.app.question_mode(settings),
+            "answer_max_attempts": self._safe_int(settings.get("answer_max_attempts"), 3),
+            "answer_window_hours": self._safe_int(settings.get("answer_window_hours"), 24),
+            "questions_updated_at": self.store.questions_updated_at(),
             "active_source": bank["source"],
             "active_count": len(usable),
             "match_mode": bank["match_mode"],
@@ -1116,6 +1155,15 @@ class Handler(BaseHTTPRequestHandler):
             answers = [str(item).strip()[:120] for item in (raw or []) if str(item).strip()][:50]
             self.store.set_setting("site_common_answers", answers)
             self.store.log("question_set_common", actor="admin", detail=f"count={len(answers)}")
+        elif action == "set_attempts":
+            raw_limit = payload.get("answer_max_attempts")
+            if isinstance(raw_limit, (list, dict)):
+                return self._error(400, "答题次数上限必须是数字")
+            limit = max(0, min(50, self._safe_int(raw_limit, 3)))
+            window = max(1, min(720, self._safe_int(payload.get("answer_window_hours"), 24)))
+            self.store.set_setting("answer_max_attempts", limit)
+            self.store.set_setting("answer_window_hours", window)
+            self.store.log("question_set_attempts", actor="admin", detail=f"limit={limit} window={window}")
         elif action == "set_mode":
             mode = str(payload.get("match_mode") or "contains").strip().lower()
             if mode not in matching.MATCH_MODES:
@@ -1243,6 +1291,9 @@ class Handler(BaseHTTPRequestHandler):
             )
         if payload.get("match_mode"):
             self.store.set_setting("plugin_match_mode", str(payload["match_mode"])[:20])
+        if payload.get("question_mode"):
+            mode = str(payload["question_mode"]).strip().lower()
+            self.store.set_setting("plugin_question_mode", mode if mode in ("plugin", "site") else "plugin")
         if payload.get("fuzzy_threshold") is not None:
             self.store.set_setting("plugin_fuzzy_threshold", matching.clamp_threshold(payload["fuzzy_threshold"]))
         self.store.set_setting("plugin_synced_at", time.time())
@@ -1261,6 +1312,35 @@ class Handler(BaseHTTPRequestHandler):
         pending = len(self.store.pull_approved(limit=200))
         self.store.log("plugin_sync", actor=f"ip:{self._client_ip()}", detail=f"code={code} pending={pending}")
         return self._json(200, {"ok": True, "site_time": time.time(), "pending_deliveries": pending})
+
+    def _api_plugin_questions(self) -> None:
+        """给插件拉取站点题库（反向同步：让 QQ 也用网站后台维护的题）。"""
+        if not self._plugin_ok():
+            return
+        settings = self.settings()
+        items = self.store.list_questions(only_enabled=True)
+        return self._json(
+            200,
+            {
+                "ok": True,
+                "mode": self.app.question_mode(settings),
+                "updated_at": self.store.questions_updated_at(),
+                "count": len(items),
+                "questions": [
+                    {
+                        "enabled": True,
+                        "question": str(item.get("question") or ""),
+                        "hint": str(item.get("hint") or ""),
+                        "answers": list(item.get("answers") or []),
+                        "match_mode": str(item.get("match_mode") or "inherit"),
+                    }
+                    for item in items
+                ],
+                "common_answers": list(settings.get("site_common_answers") or []),
+                "match_mode": str(settings.get("site_match_mode") or matching.DEFAULT_MATCH_MODE),
+                "fuzzy_threshold": matching.clamp_threshold(settings.get("site_fuzzy_threshold")),
+            },
+        )
 
     def _api_plugin_applications(self, query: dict[str, list[str]]) -> None:
         if not self._plugin_ok():

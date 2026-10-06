@@ -309,7 +309,7 @@ class FakeContext:
         return types.SimpleNamespace(
             name=name,
             display_name="临时审核群管理",
-            version="v1.1.9",
+            version="v1.2.0",
             desc="自检用元数据",
         )
 
@@ -1999,6 +1999,8 @@ async def main():
             "common_answers" in snapshot and "match_mode" in snapshot and "fuzzy_threshold" in snapshot,
             "快照带上通用答案库与匹配方式",
         )
+        check(snapshot.get("question_mode") in ("plugin", "site"), f"快照带上题库来源模式（{snapshot.get('question_mode')}）")
+        check(snapshot.get("push_code") is True, "快照带上'通过后立即发码'开关")
 
         # 网页端与插件的判定必须**逐字一致**，否则同一句话在 QQ 过、在网页不过
         matching_dir = PLUGIN_MAIN.parent / "review_web"
@@ -2094,6 +2096,95 @@ async def main():
         responses[("GET", "api/plugin/applications")] = RuntimeError("超时")
         pulled, note = await plugin._web_review_pull()
         check(pulled == 0 and "失败" in note, "拉取失败时返回原因")
+
+        # ① 反向同步题库：网站后台改的题拉回插件（web_question_mode=site）
+        plugin.config["web_question_mode"] = "plugin"
+        pulled_q, note_q = await plugin._web_review_pull_questions()
+        check(pulled_q == 0 and "无需反向同步" in note_q, f"插件题库模式不反向拉取（{note_q}）")
+        check(not [c for c in web_calls if c["path"] == "api/plugin/questions"], "插件题库模式连请求都不发")
+
+        plugin.config["web_question_mode"] = "site"
+        responses[("GET", "api/plugin/questions")] = {
+            "ok": True,
+            "mode": "site",
+            "updated_at": 1234.0,
+            "count": 2,
+            "questions": [
+                {"enabled": True, "question": "网站题：群主最喜欢的动物？", "hint": "一个字", "answers": ["猫"], "match_mode": "exact"},
+                {"enabled": True, "question": "网站题：暗号是什么？", "hint": "", "answers": ["芝麻开门"], "match_mode": "fuzzy"},
+            ],
+            "common_answers": ["邀请码1234"],
+            "match_mode": "contains",
+            "fuzzy_threshold": 0.75,
+        }
+        web_calls.clear()
+        pulled_q, note_q = await plugin._web_review_pull_questions()
+        check(pulled_q == 2 and "2 条" in note_q, f"从网站拉回 2 条题目（{note_q}）")
+        question_call = [c for c in web_calls if c["path"] == "api/plugin/questions"]
+        check(
+            question_call and question_call[0]["headers"].get("X-Review-Token") == "tok-test",
+            "拉题库用请求头带 token",
+        )
+        check(plugin.config["questions"][0]["question"] == "网站题：群主最喜欢的动物？", "网站题目写回插件配置")
+        check(plugin.config["questions"][1]["answers"] == ["芝麻开门"], "答案一起写回")
+        check(plugin.config["questions"][1]["match_mode"] == "fuzzy", "每题匹配方式一起写回")
+        check(plugin.config["common_answers"] == ["邀请码1234"], "网站通用答案库写回插件配置")
+        check(plugin.config.saved, "改题库走 save_config 落盘")
+        pulled_q, note_q = await plugin._web_review_pull_questions()
+        check(pulled_q == 0 and "没有变化" in note_q, f"内容没变时不重复写配置（{note_q}）")
+
+        # ③ 网页后台通过后立即私发验证码
+        plugin.config["web_review_push_code"] = True
+        plugin.config["code_send_mode"] = "private"
+        plugin.config["private_send_channel"] = "auto"
+        plugin._state["code"] = "PUSH88"
+        responses[("GET", "api/plugin/applications")] = {
+            "ok": True,
+            "count": 1,
+            "items": [{"id": 88, "qq": "90011", "uid": "80000011", "uid_name": "被一键通过的人"}],
+        }
+        responses[("POST", "api/plugin/ack")] = {"ok": True, "acked": 1}
+        client.temp_sessions.clear()
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 1 and "立即私发验证码 1/1" in note, f"拉取后立即发码（{note}）")
+        check(
+            client.temp_sessions and str(client.temp_sessions[-1]["user_id"]) == "90011"
+            and "PUSH88" in str(client.temp_sessions[-1]["message"]),
+            "验证码真的私发给了那个 QQ",
+        )
+        # 关掉开关就不再发
+        plugin.config["web_review_push_code"] = False
+        responses[("GET", "api/plugin/applications")] = {
+            "ok": True,
+            "count": 1,
+            "items": [{"id": 89, "qq": "90012", "uid": "80000012", "uid_name": "别人"}],
+        }
+        client.temp_sessions.clear()
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 1 and "立即私发" not in note, f"关闭开关后不立即发码（{note}）")
+        check(not client.temp_sessions, "关闭开关后确实没发")
+        # 临时会话发不出去时：记录失败但不影响接收
+        plugin.config["web_review_push_code"] = True
+        client.fail_temp_session = True   # 临时会话失败
+        context.fail_private = True       # 好友私聊也失败
+        responses[("GET", "api/plugin/applications")] = {
+            "ok": True,
+            "count": 1,
+            "items": [{"id": 90, "qq": "90013", "uid": "80000013", "uid_name": "发不出去的人"}],
+        }
+        client.calls.clear()
+        pulled, note = await plugin._web_review_pull()
+        check(pulled == 1 and "0/1" in note, f"发不出去时如实报 0/1（{note}）")
+        check(plugin._state["approved"].get("123456:90013"), "发不出去也照样记为已通过")
+        check(context.private_failures, "确实尝试过私聊并失败")
+        client.fail_temp_session = False
+        context.fail_private = False
+        # 收尾：把题库与来源模式恢复成后面用例期望的样子
+        plugin.config["questions"] = [
+            {"__template_key": "question_item", "enabled": True, "question": "1+1=?", "hint": "", "answers": ["2"], "match_mode": "inherit"}
+        ]
+        plugin.config["common_answers"] = []
+        plugin.config["web_question_mode"] = "plugin"
 
         # 网页已通过的人入群：不提问、直接发码
         plugin.config["web_review_auto_approve"] = True

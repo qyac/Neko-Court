@@ -368,6 +368,22 @@
     "hint": "放在 nginx/caddy 后面时打开：只有这时才读 X-Forwarded-For（否则客户端可以伪造 IP 绕过限流）。直接对外暴露时保持关闭。",
     "default": false
   },
+  "web_question_mode": {
+    "description": "网页出题以谁的题库为准",
+    "type": "string",
+    "default": "plugin",
+    "options": [
+      "plugin",
+      "site"
+    ],
+    "hint": "plugin=插件题库为准（网页用插件里配的题，网站后台的站点题库不参与）；site=网站题库为准（插件会每隔一个周期把网站后台维护的题目拉回来，QQ 与网页共用一套题）"
+  },
+  "web_review_push_code": {
+    "description": "网页后台通过后立即私发验证码",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后：管理员在网站后台点通过，插件在一个轮询周期内就尝试把验证码私发给该 QQ（临时会话优先，失败退回好友私聊）。发不出去也不要紧，他入群时会再发一次。"
+  },
   "code_length": {
     "type": "int",
     "description": "验证码长度",

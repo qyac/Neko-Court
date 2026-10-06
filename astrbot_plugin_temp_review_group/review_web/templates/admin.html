@@ -234,6 +234,21 @@
           <p class="hint" id="site-common-hint">通用答案对题库里的所有题目都算答对（可留空）。输入后按回车或点「添加」，点答案上的 ✕ 删除。</p>
         </div>
 
+        <div class="settings-grid">
+          <div class="field">
+            <label for="answer-max-attempts">答题错误次数上限</label>
+            <input id="answer-max-attempts" type="number" min="0" max="50" step="1"
+                   inputmode="numeric" aria-describedby="answer-max-attempts-hint">
+            <p class="hint" id="answer-max-attempts-hint">同一个 QQ 在下面这个时间窗口内最多答错几次；填 0 表示不限（只判对错，不拦提交）。超过上限会提示联系管理员。</p>
+          </div>
+          <div class="field">
+            <label for="answer-window-hours">统计窗口（小时）</label>
+            <input id="answer-window-hours" type="number" min="1" max="720" step="1"
+                   inputmode="numeric" aria-describedby="answer-window-hours-hint">
+            <p class="hint" id="answer-window-hours-hint">只统计这个时间窗口内的答错次数（默认 24 小时）。</p>
+          </div>
+        </div>
+
         <p class="hint" id="plugin-synced-at" style="color:var(--text-muted);font-size:0.86rem">插件题库同步时间：尚未同步</p>
       </fieldset>
 

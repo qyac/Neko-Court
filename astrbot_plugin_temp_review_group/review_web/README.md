@@ -97,6 +97,21 @@ python review-site/serve.py --print-config
 
 ## 网页答题与题库
 
+**题目以谁的题库为准**由插件配置 `web_question_mode` 决定（插件会把这个设置同步过来，站点只读显示）：
+
+| 模式 | 出题用哪套题 | QS 侧用什么 |
+| --- | --- | --- |
+| `plugin`（默认） | 插件题库（站点题库不参与出题） | 插件题库 |
+| `site` | 站点题库 | 插件每轮把站点题库**反向拉回插件配置**，所以 QQ 与网页共用一套题 |
+
+**答题错误次数限制**：同一个 QQ 在窗口内答错到上限后，再提交会被直接拒绝（提示联系管理员）。
+默认「24 小时内最多 3 次」，可在后台题库面板调整，填 0 表示不限。
+
+**后台一键通过后立即发码**：管理员在后台点「通过」后，插件在下一个轮询周期就会尝试把当日验证码
+私发给该 QQ（临时会话优先，失败退回好友私聊）；发不出去也不要紧，他入群时会再发一次。
+这个行为由插件的 `web_review_push_code` 开关控制（默认开）。
+
+
 网页可以像 QQ 里一样出题，题库有两个来源，**站点题库优先**：
 
 | 来源 | 说明 |
@@ -135,7 +150,8 @@ python review-site/serve.py --print-config
 | GET | `/api/apply/<ticket>` | 无 | 按 ticket 轮询自己的申请状态 |
 | GET | `/api/questions` | 无 | 取一道题给申请页（**只回题干与提示，不回答案**） |
 | GET | `/api/admin/questions` | 会话 | 读题库（站点题 + 插件题 + 开关与匹配设置） |
-| POST | `/api/admin/questions` | 会话 + CSRF | `upsert`/`delete`/`toggle`/`clear`/`set_ask`/`set_common`/`set_mode` |
+| POST | `/api/admin/questions` | 会话 + CSRF | `upsert`/`delete`/`toggle`/`clear`/`set_ask`/`set_common`/`set_mode`/`set_attempts` |
+| GET | `/api/plugin/questions` | 插件 token | 插件反向拉取站点题库（`plugin` 模式下不会调用） |
 | POST | `/api/admin/login` | 密码 | 登录（失败多次按 IP 锁定 60 秒） |
 | GET | `/api/admin/applications` | 会话 | 列表（`status`/`q`/`offset`，每页 50） |
 | POST | `/api/admin/decision` | 会话 + CSRF | `approve`/`reject`/`manual`/`block`/`unblock` |
@@ -228,7 +244,7 @@ Windows 上可以用 `pythonw.exe review-site/serve.py --host 0.0.0.0` 配合任
 ## 自检
 
 ```bash
-python selftest_review_site.py     # 196 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
+python selftest_review_site.py     # 224 项：接口、鉴权、CSRF、限流、核验分支、同步/拉取、模板结构、安全回归
 node   selftest_review_site_ui.mjs # 74 项：纯函数边界、模板契约、渲染模拟、脚本语法
 ```
 
@@ -254,7 +270,7 @@ python tools/diagnose_site.py --astrbot /opt/AstrBot --remote   # 从别的机�
 | 浏览器"拒绝连接" | 端口上没人监听：插件没加载、开关没开、或站点启动失败 | 看 AstrBot 日志里 `内置审核网站已启动` / `内置审核网站启动失败`；后者通常是端口被占用，改 `web_site_port` |
 | 打开了却是别的页面 | 记错了端口：审核网站是**独立端口**（默认 8787），不是 AstrBot 控制台端口 | 申请页 `http://IP:8787/`，后台 `http://IP:8787/admin` |
 | 端口有人在听但页面报错 | 那个端口被别的程序占了 | 换 `web_site_port` |
-| 改了密码却登不上 | 旧版本缓存了密码哈希（v1.1.9 已修） | 升级到 v1.1.9+，或重启插件 |
+| 改了密码却登不上 | 旧版本缓存了密码哈希（v1.2.0 已修） | 升级到 v1.2.0+，或重启插件 |
 
 卡片里最快的一步：在机器人那台机器上访问 `http://127.0.0.1:8787/healthz`，返回 `{"ok": true, "version": ...}` 就说明站点本身没问题，问题在"怎么访问"（host/防火墙/IP）。
 

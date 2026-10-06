@@ -698,6 +698,18 @@ def main() -> int:
         matched_csrf = re.search(r'"csrf":\s*"([^"]+)"', body_admin)
         csrf = matched_csrf.group(1) if matched_csrf else ""
         check(bool(csrf), "（前置）拿到当前会话的 CSRF")
+        # 新语义：题目来源由插件同步的 question_mode 决定，这里显式切到"以站点题库为准"
+        status, _, _ = http.json(
+            "/api/plugin/sync",
+            method="POST",
+            payload={
+                "token": "test-token-0123456789abcdef",
+                "question_mode": "site",
+                "questions": [],
+                "common_answers": [],
+            },
+        )
+        check(status == 200, "（前置）切换题目来源为站点题库")
 
         # 站点题库：新增一道（管理员操作），并把网页答题打开
         status, data, _ = http.json(
@@ -849,15 +861,16 @@ def main() -> int:
             "common_answers": [],
             "match_mode": "contains",
             "fuzzy_threshold": 0.8,
+            "question_mode": "plugin",
         })
-        check(status == 200, "同步题库成功")
+        check(status == 200, "同步题库成功（并切回以插件题库为准）")
         status, data, _ = http.json(
             "/api/admin/questions",
             method="POST",
             payload={"csrf": csrf, "action": "clear"},
             cookie=http.cookie,
         )
-        check(data["site"] == [] and data["active_source"] == "plugin", "站点题库清空后自动用插件题库")
+        check(data["site"] == [] and data["active_source"] == "plugin", "插件题库模式下以插件题库为准")
         check(data["plugin"] and data["plugin"][0]["question"] == "插件题：1+1=?", "能读到插件题库")
         status, body, _ = http("/api/questions")
         plugin_question = json.loads(body)
@@ -891,6 +904,120 @@ def main() -> int:
         check(status == 401, "未登录读题库 -> 401")
         status, data, _ = http.json("/api/admin/questions", method="POST", payload={"action": "clear"}, cookie=http.cookie)
         check(status == 403, "写题库缺 CSRF -> 403")
+
+        print("\n[10] 三项增强：题库来源模式 / 答题次数限制 / 反向同步接口")
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "set_ask", "enabled": True},
+            cookie=http.cookie,
+        )
+        check(data["ask_questions"] is True, "（前置）重新打开网页答题")
+
+        # ---- 1) 题库来源模式 ----
+        plugin_bank = {
+            "token": "test-token-0123456789abcdef",
+            "questions": [{"enabled": True, "question": "插件题：1+1=?", "hint": "", "answers": ["2"], "match_mode": "contains"}],
+            "common_answers": [],
+            "match_mode": "contains",
+            "fuzzy_threshold": 0.8,
+            "question_mode": "plugin",
+        }
+        status, data, _ = http.json("/api/plugin/sync", method="POST", payload=dict(plugin_bank))
+        check(status == 200, "同步带上题库来源模式")
+        status, data, _ = http.json("/api/admin/questions", cookie=http.cookie)
+        check(data["question_mode"] == "plugin", f"站点记录了来源模式（{data['question_mode']}）")
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "upsert", "question": "站点题：本群主打什么？", "answers": ["猫猫"], "match_mode": "contains"},
+            cookie=http.cookie,
+        )
+        check(data["active_source"] == "plugin" and data["active_count"] == 1, "plugin 模式下站点题库不参与出题")
+        status, body, _ = http("/api/questions")
+        check(json.loads(body)["question"] == "插件题：1+1=?", "plugin 模式下出的是插件题")
+        # 切到 site 模式：只用站点题库
+        status, data, _ = http.json("/api/plugin/sync", method="POST", payload=dict(plugin_bank, question_mode="site"))
+        check(data is not None, "同步切换为 site 模式")
+        status, data, _ = http.json("/api/admin/questions", cookie=http.cookie)
+        check(data["question_mode"] == "site" and data["active_source"] == "site", "site 模式以站点题库为准")
+        status, body, _ = http("/api/questions")
+        check(json.loads(body)["question"] == "站点题：本群主打什么？", "site 模式下出的是站点题")
+        # 站点题库清空后：site 模式没有题可出（不回退插件题库）
+        status, data, _ = http.json("/api/admin/questions", method="POST", payload={"csrf": csrf, "action": "clear"}, cookie=http.cookie)
+        status, body, _ = http("/api/questions")
+        check(json.loads(body)["enabled"] is False, "site 模式且站点题库为空时不出题（不回退插件题库）")
+        status, data, _ = http.json("/api/admin/questions", cookie=http.cookie)
+        check(data["active_source"] == "none", "此时来源为 none")
+
+        # ---- 2) 答题次数限制 ----
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "upsert", "question": "限次题：1+1=?", "answers": ["2"], "match_mode": "contains"},
+            cookie=http.cookie,
+        )
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "set_attempts", "answer_max_attempts": 2, "answer_window_hours": 24},
+            cookie=http.cookie,
+        )
+        check(data["answer_max_attempts"] == 2, "设置答题次数上限为 2")
+        asked = "限次题：1+1=?"
+        limited_qq = "12500011"
+        for index in (1, 2):
+            state["payload"] = card(name=f"答错{index}", level=3, fans=10)
+            bili.clear_cache()
+            status, data, _ = http.json("/api/apply", method="POST", payload={"qq": limited_qq, "uid": f"86010{index}0", "question": asked, "answer": "错"})
+            check(data.get("status") == "rejected", f"第 {index} 次答错被拒（{data.get('status')}）")
+        check(store.count_wrong_answers(limited_qq, since=0) == 2, "答错次数被记录")
+        state["payload"] = card(name="第三次", level=3, fans=10)
+        bili.clear_cache()
+        status, data, _ = http.json("/api/apply", method="POST", payload={"qq": limited_qq, "uid": "8601030", "question": asked, "answer": "错"})
+        check(status == 400 and "次数过多" in data.get("error", ""), f"超过上限后直接拒绝（{data.get('error')}）")
+        # 换个 QQ 不受影响
+        state["payload"] = card(name="别人", level=3, fans=10)
+        bili.clear_cache()
+        status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12500012", "uid": "8601040", "question": asked, "answer": "2"})
+        check(data.get("status") == "approved", "换个人不受影响（答对仍通过）")
+        # 0 = 不限
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "set_attempts", "answer_max_attempts": 0},
+            cookie=http.cookie,
+        )
+        check(data["answer_max_attempts"] == 0, "上限设为 0 = 不限")
+        state["payload"] = card(name="不限次", level=3, fans=10)
+        bili.clear_cache()
+        status, data, _ = http.json("/api/apply", method="POST", payload={"qq": "12500013", "uid": "8601050", "question": asked, "answer": "又错"})
+        check(data.get("status") == "rejected", f"不限次数时答错只判不通过（{data.get('status')}）")
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "set_attempts", "answer_max_attempts": 3},
+            cookie=http.cookie,
+        )
+        status, data, _ = http.json(
+            "/api/admin/questions",
+            method="POST",
+            payload={"csrf": csrf, "action": "set_attempts", "answer_max_attempts": [1]},
+            cookie=http.cookie,
+        )
+        check(status == 400, "非法次数（列表）被拒")
+
+        # ---- 3) 反向同步接口 ----
+        status, data, _ = http("/api/plugin/questions")
+        check(status == 401, "反向同步接口没 token -> 401")
+        status, data, _ = http("/api/plugin/questions", headers={"X-Review-Token": "bad-token"})
+        check(status == 401, "token 不对 -> 401")
+        status, body, _ = http("/api/plugin/questions", headers={"X-Review-Token": "test-token-0123456789abcdef"})
+        pulled = json.loads(body)
+        check(status == 200 and pulled["ok"] is True, f"插件能拉站点题库（{status}）")
+        check(len(pulled["questions"]) == 1 and pulled["questions"][0]["answers"] == ["2"], "拉到的题目与答案一致")
+        check(pulled["mode"] == "site" and pulled["updated_at"] > 0, "带上来源模式与题库更新时间")
+        check(pulled["questions"][0]["match_mode"] == "contains", "每题匹配方式一起给出")
 
         print("\n[8] 前端资源结构")
         for name in ("apply.html", "login.html", "admin.html"):

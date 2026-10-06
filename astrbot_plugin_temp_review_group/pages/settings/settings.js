@@ -69,6 +69,8 @@ export const FIELD_GROUPS = [
       "web_site_host",
       "web_site_port",
       "web_site_trust_proxy",
+    "web_question_mode",
+    "web_review_push_code",
     ],
   },
   {

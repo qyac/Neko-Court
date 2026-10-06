@@ -1124,6 +1124,8 @@ check("静态检查: app.js 使用题库接口与全部 action", () => {
     '"set_ask"',
     '"set_common"',
     '"set_mode"',
+    '"set_attempts"',
+    "answer_max_attempts",
     "当前出题来源",
     "尚未同步",
     "站点题库为空时",

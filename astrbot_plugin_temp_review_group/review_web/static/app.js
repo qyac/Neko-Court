@@ -46,6 +46,7 @@ const QUESTION_ACTIONS = Object.freeze({
   setAsk: "set_ask",
   setCommon: "set_common",
   setMode: "set_mode",
+  setAttempts: "set_attempts",
 });
 /** 后端答错时的固定文案（reason 里不含参考答案）。 */
 const ANSWER_REJECTION_RE = /回答不正确|答案不正确|再试一次|重新作答/;
@@ -1255,6 +1256,8 @@ function initQuestionBankPanel() {
   const askToggle = byId("ask-questions");
   const modeSelect = byId("site-match-mode");
   const thresholdInput = byId("site-fuzzy-threshold");
+  const attemptsInput = byId("answer-max-attempts");
+  const windowHoursInput = byId("answer-window-hours");
   const commonHost = byId("site-common-editor");
   const siteHost = byId("site-questions");
   const pluginHost = byId("plugin-questions");
@@ -1271,6 +1274,9 @@ function initQuestionBankPanel() {
     activeCount: 0,
     siteCount: 0,
     pluginCount: 0,
+    questionMode: "plugin",
+    answerMaxAttempts: 3,
+    answerWindowHours: 24,
     mode: "contains",
     threshold: 0.8,
     modeOptions: [],
@@ -1441,9 +1447,15 @@ function initQuestionBankPanel() {
   function renderStatus() {
     if (statusLine) {
       const sourceLabel = questionSourceLabel(bank.source) || "无可用题目";
+      const modeText = bank.questionMode === "site"
+        ? "题目以网站题库为准（插件会把这里维护的题目同步回 QQ）"
+        : "题目以插件题库为准（站点题库暂不参与出题）";
+      const limitText = bank.answerMaxAttempts > 0
+        ? `答错上限 ${bank.answerMaxAttempts} 次/${bank.answerWindowHours} 小时`
+        : "答错次数不限";
       statusLine.textContent =
-        `当前出题来源：${sourceLabel}（站点题库 ${bank.siteCount} 条 / 插件题库 ${bank.pluginCount} 条，` +
-        `可用题目 ${bank.activeCount} 道）；网页答题${bank.ask ? "已开启" : "已关闭"}。`;
+        `${modeText}。当前出题来源：${sourceLabel}（站点题库 ${bank.siteCount} 条 / 插件题库 ${bank.pluginCount} 条，` +
+        `可用题目 ${bank.activeCount} 道）；网页答题${bank.ask ? "已开启" : "已关闭"}；${limitText}。`;
     }
     if (syncedLine) {
       syncedLine.textContent = bank.syncedAt
@@ -1469,9 +1481,22 @@ function initQuestionBankPanel() {
     );
   }
 
+  // 答题错误次数上限 / 统计窗口（同一个 action 提交）
+  const submitAttempts = () => {
+    const limit = Math.max(0, Math.min(50, Math.floor(Number(attemptsInput && attemptsInput.value)) || 0));
+    const hours = Math.max(1, Math.min(720, Math.floor(Number(windowHoursInput && windowHoursInput.value)) || 24));
+    if (attemptsInput) attemptsInput.value = String(limit);
+    if (windowHoursInput) windowHoursInput.value = String(hours);
+    submitBank({ action: QUESTION_ACTIONS.setAttempts, answer_max_attempts: limit, answer_window_hours: hours });
+  };
+  if (attemptsInput) attemptsInput.addEventListener("change", submitAttempts);
+  if (windowHoursInput) windowHoursInput.addEventListener("change", submitAttempts);
+
   function renderGlobalControls() {
     if (askToggle) askToggle.checked = bank.ask === true;
     if (modeSelect) modeOptionsInto(modeSelect, bank.mode);
+    if (attemptsInput) attemptsInput.value = String(bank.answerMaxAttempts);
+    if (windowHoursInput) windowHoursInput.value = String(bank.answerWindowHours);
     if (thresholdInput) thresholdInput.value = String(normalizeThreshold(bank.threshold));
     renderCommonEditor();
   }
@@ -1635,7 +1660,10 @@ function initQuestionBankPanel() {
 
     if (siteHost && !bank.drafts.length) {
       siteHost.append(
-        hintLine("站点题库为空时，网页会用插件同步过来的题目（也可以点「新增题目」自己加）。"),
+        hintLine(
+          "站点题库为空时，网页出的题来自插件同步的题库（也可以点「新增题目」自己加）。" +
+            "注意：题目来源由 AstrBot 插件配置里的「网页出题以谁的题库为准」决定——选 plugin 时以插件题库为准，选 site 时才以这里的站点题库为准。",
+        ),
       );
     }
     if (pluginHost && !bank.plugin.length) {
@@ -1678,6 +1706,11 @@ function initQuestionBankPanel() {
     bank.serverThreshold = bank.threshold;
     bank.serverAsk = bank.ask;
     bank.syncedAt = Number(source.plugin_synced_at) || 0;
+    bank.questionMode = text(source.question_mode, "plugin") === "site" ? "site" : "plugin";
+    bank.answerMaxAttempts = Number(source.answer_max_attempts);
+    if (!Number.isFinite(bank.answerMaxAttempts) || bank.answerMaxAttempts < 0) bank.answerMaxAttempts = 3;
+    bank.answerWindowHours = Number(source.answer_window_hours);
+    if (!Number.isFinite(bank.answerWindowHours) || bank.answerWindowHours < 1) bank.answerWindowHours = 24;
     // 局部刷新时尽量保留已保存题目的展开状态（重渲染会重建 DOM）
     const previous = new Map();
     for (const item of bank.drafts) {
